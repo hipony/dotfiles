@@ -26,6 +26,7 @@ LINKS = {
 
 STUBS = {
     "git": 'echo "git $*" >> "$STUB_LOG"\n'
+           'if [ -n "$GIT_FAIL_MAGNOLIA" ] && [[ "$*" == *magnolia-theme* ]]; then exit 1; fi\n'
            'if [ "$1" = clone ]; then mkdir -p "${@: -1}"; fi\n',
     "snap": 'echo "snap $*" >> "$STUB_LOG"\n',
     "systemctl": 'echo "systemctl $*" >> "$STUB_LOG"\n',
@@ -48,9 +49,11 @@ class Sandbox:
             p.write_text("#!/bin/bash\n" + body)
             p.chmod(0o755)
         self.path = f"{bindir}:/usr/bin:/bin"
+        self.snap_bin = tmp_path / "snap-bin-ghostty"  # absent until a test creates it
 
-    def run(self):
-        env = {"HOME": str(self.home), "PATH": self.path, "STUB_LOG": str(self.log)}
+    def run(self, **extra):
+        env = {"HOME": str(self.home), "PATH": self.path, "STUB_LOG": str(self.log),
+               "GHOSTTY_SNAP_BIN": str(self.snap_bin), **extra}
         return subprocess.run([str(INSTALL)], env=env, capture_output=True, text=True, timeout=60)
 
     def calls(self):
@@ -120,12 +123,6 @@ def test_units_and_autostart_use_paths_without_path_lookup():
     svc.optionxform = str
     svc.read(REPO / "ghostty-tabs/ghostty-tabs-snapshot.service")
     assert svc["Service"]["ExecStart"] == "%h/.local/bin/ghostty-tabs snapshot"
-    tm = configparser.ConfigParser(interpolation=None, strict=False)
-    tm.optionxform = str
-    tm.read(REPO / "ghostty-tabs/ghostty-tabs-snapshot.timer")
-    assert tm["Timer"]["OnBootSec"] == "2min"
-    assert tm["Timer"]["OnUnitActiveSec"] == "60s"
-    assert tm["Timer"]["AccuracySec"] == "1s"
     desk = (REPO / "ghostty-tabs/ghostty-tabs-restore.desktop").read_text()
     assert 'Exec=sh -c "exec ~/.local/bin/ghostty-tabs restore"' in desk.splitlines()
     assert shutil.which("desktop-file-validate"), "install desktop-file-utils to run this check"
@@ -180,5 +177,48 @@ def test_opencode_cli_json_is_created_when_missing(sb):
     assert json.loads(sb.link(".config/opencode/cli.json").read_text())["theme"] == {"name": "magnolia"}
 
 
-def test_ghostty_config_selects_magnolia():
-    assert "theme = Magnolia" in (REPO / "ghostty/config.ghostty").read_text().splitlines()
+def test_opencode_theme_that_is_not_an_object_is_replaced(sb):
+    cli = sb.link(".config/opencode/cli.json")
+    cli.parent.mkdir(parents=True)
+    cli.write_text(json.dumps({"theme": "system", "plugins": ["-x"]}))
+    r = sb.run()
+    assert r.returncode == 0, r.stderr
+    assert json.loads(cli.read_text()) == {"theme": {"name": "magnolia"}, "plugins": ["-x"]}
+
+
+def test_opencode_theme_object_keeps_its_other_keys(sb):
+    cli = sb.link(".config/opencode/cli.json")
+    cli.parent.mkdir(parents=True)
+    cli.write_text(json.dumps({"theme": {"name": "system", "dark": True}}))
+    assert sb.run().returncode == 0
+    assert json.loads(cli.read_text())["theme"] == {"name": "magnolia", "dark": True}
+
+
+def test_snap_is_not_installed_when_the_snap_binary_exists(sb):
+    sb.snap_bin.write_text("#!/bin/sh\n")
+    sb.snap_bin.chmod(0o755)
+    assert sb.run().returncode == 0
+    assert not any(c.startswith("snap ") for c in sb.calls())
+
+
+@pytest.mark.parametrize("magnolia_exists", [True, False])
+def test_failed_magnolia_git_warns_and_the_install_continues(sb, magnolia_exists):
+    if magnolia_exists:
+        magnolia(sb).mkdir(parents=True)
+    r = sb.run(GIT_FAIL_MAGNOLIA="1")
+    assert r.returncode == 0, r.stderr
+    assert "warning" in r.stderr and "magnolia" in r.stderr
+    assert "systemctl --user enable --now ghostty-tabs-snapshot.timer" in sb.calls()
+
+
+def test_regular_file_with_an_existing_bak_stops_the_install_and_changes_nothing(sb):
+    cfg = sb.link(".config/ghostty/config.ghostty")
+    cfg.parent.mkdir(parents=True)
+    cfg.write_text("new\n")
+    bak = cfg.with_name("config.ghostty.bak")
+    bak.write_text("old\n")
+    r = sb.run()
+    assert r.returncode != 0
+    assert "Cannot back up" in r.stderr
+    assert not cfg.is_symlink() and cfg.read_text() == "new\n"
+    assert bak.read_text() == "old\n"

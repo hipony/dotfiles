@@ -36,7 +36,9 @@ ln -sf $DIR/zshrc ~/.zshrc
 [ -d ~/.oh-my-zsh/custom/plugins/zsh-syntax-highlighting ] || git clone https://github.com/zsh-users/zsh-syntax-highlighting ~/.oh-my-zsh/custom/plugins/zsh-syntax-highlighting
 
 # Ghostty tab restore
-if ! command -v ghostty > /dev/null; then
+# The D-Bus and systemd files of this repo start /snap/bin/ghostty.
+# GHOSTTY_SNAP_BIN lets a test point this check elsewhere.
+if [ ! -x "${GHOSTTY_SNAP_BIN:-/snap/bin/ghostty}" ]; then
   snap install ghostty --classic --channel=latest/stable
 fi
 
@@ -51,9 +53,11 @@ link "$DIR/ghostty/app-com.mitchellh.ghostty.service" ~/.config/systemd/user/app
 
 MAGNOLIA="$HOME/dev/magnolia-theme"
 if [ -d "$MAGNOLIA" ]; then
-  git -C "$MAGNOLIA" pull --ff-only
+  git -C "$MAGNOLIA" pull --ff-only ||
+    echo "warning: git pull of $MAGNOLIA failed; the theme may be out of date" >&2
 else
-  git clone https://github.com/hipony/magnolia-theme.git "$MAGNOLIA"
+  git clone https://github.com/hipony/magnolia-theme.git "$MAGNOLIA" ||
+    echo "warning: git clone of magnolia-theme failed; the theme links stay broken" >&2
 fi
 link "$MAGNOLIA/exports/ghostty/Magnolia.ghostty" ~/.config/ghostty/themes/Magnolia
 link "$MAGNOLIA/exports/opencode/magnolia.json" ~/.config/opencode/themes/magnolia.json
@@ -65,7 +69,8 @@ data = {}
 if os.path.exists(path):
     with open(path) as f:
         data = json.load(f)
-data["theme"] = {**data.get("theme", {}), "name": "magnolia"}
+theme = data.get("theme")
+data["theme"] = {**theme, "name": "magnolia"} if isinstance(theme, dict) else {"name": "magnolia"}
 tmp = path + ".tmp"
 with open(tmp, "w") as f:
     json.dump(data, f, indent=2)

@@ -5,14 +5,22 @@ the directory that holds the process files of the parent chain (default
 /proc). The tests build a fake root, so no test depends on the real parent
 being Ghostty. The shell reads its own start time from the real /proc.
 """
+import importlib.machinery
+import importlib.util
 import json
 import os
 import subprocess
+import time
 from pathlib import Path
 
 import pytest
 
 TABS_ZSH = Path(__file__).with_name("tabs.zsh")
+
+_loader = importlib.machinery.SourceFileLoader("ghostty_tabs", str(Path(__file__).with_name("ghostty-tabs")))
+_spec = importlib.util.spec_from_loader("ghostty_tabs", _loader)
+gt = importlib.util.module_from_spec(_spec)
+_loader.exec_module(gt)
 
 # Appended to .zshrc after tabs.zsh: copies the live record to $PROBE_OUT
 # at each prompt, after the hooks of tabs.zsh ran.
@@ -57,14 +65,17 @@ class Shell:
         g.mkdir()
         (g / "comm").write_text("ghostty\n")
 
-    def run(self, script, env=None, tab=True):
+    def environ(self, env=None, tab=True):
         e = {k: v for k, v in os.environ.items() if not k.startswith("GHOSTTY_")}
         e.update(HOME=str(self.home), ZDOTDIR=str(self.zdot),
                  PROBE_OUT=str(self.out))
         if tab:
             e["GHOSTTY_TABS_PROC_ROOT"] = str(self.proc)
         e.update(env or {})
-        r = subprocess.run(["zsh", "-i"], input=script, env=e,
+        return e
+
+    def run(self, script, env=None, tab=True):
+        r = subprocess.run(["zsh", "-i"], input=script, env=self.environ(env, tab),
                            capture_output=True, text=True, timeout=30,
                            cwd=self.cwd)
         return r
@@ -122,11 +133,10 @@ def test_cd_and_command_update_record(sh, tmp_path):
     assert p[0]["cwd"] == str(sh.cwd)
     assert p[1]["cwd"] == str(d)
     assert p[1]["running"] == ""
-    assert p[1]["last"] == f"cd {d}"
     during = json.loads((sh.out / "during").read_text())
     assert during["running"].startswith("print -r --")
     assert p[2]["running"] == ""
-    assert p[2]["last"] == during["running"]
+    assert set(p[0]) == {"pid", "start", "cwd", "running", "pending"}
     assert during["pid"] > 0 and during["start"] > 0
 
 
@@ -134,7 +144,8 @@ def test_hostile_text_gives_valid_json_with_original_text(sh, tmp_path):
     sh.fake_parent()
     d = tmp_path / 'we"ird\\dir\nwith\ttab'
     d.mkdir()
-    cmd = "print -r -- 'a\"b\\c\nd\te' > /dev/null"
+    cmd = ('print -r -- "$(<$HOME/.local/state/ghostty-tabs/live/$$.json)" > $PROBE_OUT/during; '
+           "print -r -- 'a\"b\\c\nd\te' > /dev/null")
     sh.run(f'cd -- "$D"\n{cmd}\ntrue\n', env={"D": str(d)})
     line = (sh.out / "prompts").read_text().splitlines()
     assert all("\n" not in x for x in line)
@@ -145,7 +156,7 @@ def test_hostile_text_gives_valid_json_with_original_text(sh, tmp_path):
         assert r.returncode == 0, r.stderr
     p = sh.prompts()
     assert p[1]["cwd"] == str(d)
-    assert p[2]["last"] == cmd
+    assert json.loads((sh.out / "during").read_text())["running"] == cmd
 
 
 def test_record_removed_at_exit_and_no_tmp_left(sh):
@@ -176,7 +187,6 @@ def test_restored_tab_runs_command_once_with_live_record(sh):
     assert "a note" in r.stdout
     p = sh.prompts()
     assert p[0]["running"] == ""
-    assert p[0]["last"] == run
 
 
 def test_restored_tab_prefill_in_pending_and_buffer(sh):
@@ -232,10 +242,21 @@ def test_record_correct_with_hostile_shell_options(sh, tmp_path):
            'cd -- "$D"\ntrue\n', env={"D": str(d)})
     p = sh.prompts()
     assert p[-1]["cwd"] == str(d)
-    assert p[-1]["last"] == "true"
 
 
-def test_tab_shell_check_function_is_removed(sh):
+def test_record_start_equals_the_process_table_start_of_the_same_pid(sh):
     sh.fake_parent()
-    r = sh.run('print -r -- "fn=${+functions[_ghostty_tabs_is_tab_shell]}"\n')
-    assert "fn=0" in r.stdout
+    p = subprocess.Popen(["zsh", "-i"], stdin=subprocess.PIPE, text=True, env=sh.environ(),
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, cwd=sh.cwd)
+    try:
+        record = sh.live / f"{p.pid}.json"
+        for _ in range(100):
+            if record.exists():
+                break
+            time.sleep(0.1)
+        rec = json.loads(record.read_text())
+        assert rec["pid"] == p.pid
+        assert gt.read_process_table()[p.pid].start == rec["start"]
+    finally:
+        p.stdin.close()
+        p.wait(timeout=30)

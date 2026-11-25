@@ -79,7 +79,7 @@ def read_live_records(live_dir, table):
         if not RECORD_NAME.fullmatch(path.name):
             continue
         try:
-            rec = json.loads(path.read_text())
+            rec = json.loads(path.read_bytes().decode("utf-8", "surrogateescape"))
             proc = table.get(rec["pid"])
             alive = (proc is not None and proc.start == rec["start"]
                      and isinstance(rec["cwd"], str))
@@ -296,12 +296,17 @@ def restore(home, *, mode, boot_id, get_version, env, isdir, new_id, run_ghostty
             argv = build_ghostty_argv(resolved, action="+new-window", surface_id=None,
                                       tab_id=tab_id, **common)
             for attempt in range(WINDOW_TRIES):
+                if attempt:
+                    sleep(WINDOW_RETRY_SECONDS)
+                    # A failed call (a timeout, for one) may have opened the
+                    # window late: check just before the retry.
+                    surface_id = find_surface_id(tab_id)
+                    if surface_id:
+                        break
                 ok, err = run_ghostty(argv)
                 if ok:
                     break
                 log(f"+new-window failed (try {attempt + 1} of {WINDOW_TRIES}): {err}")
-                if attempt < WINDOW_TRIES - 1:
-                    sleep(WINDOW_RETRY_SECONDS)
             else:
                 msg = "Ghostty did not open a window; run ghostty-tabs restore"
                 log(msg)
@@ -309,7 +314,7 @@ def restore(home, *, mode, boot_id, get_version, env, isdir, new_id, run_ghostty
                 return "no-window"
             deadline = monotonic() + SURFACE_WAIT_SECONDS
             while True:
-                surface_id = find_surface_id(tab_id)
+                surface_id = surface_id or find_surface_id(tab_id)
                 if surface_id or monotonic() >= deadline:
                     break
                 sleep(SURFACE_POLL_SECONDS)
@@ -371,6 +376,11 @@ def find_surface_id(tab_id, proc_root="/proc"):
     return None
 
 
+def printable(message):
+    """Return message with each undecodable path byte escaped, so a log write cannot fail."""
+    return message.encode("utf-8", "surrogateescape").decode("utf-8", "backslashreplace")
+
+
 def notify_send(message):
     try:
         subprocess.run(["notify-send", "ghostty-tabs", message], timeout=10)
@@ -383,6 +393,7 @@ def cmd_restore(mode):
     log_path = state_root(home) / "restore.log"
 
     def log(message):
+        message = printable(message)
         print(message, file=sys.stderr)
         try:
             log_path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)

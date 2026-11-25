@@ -37,19 +37,19 @@ class Env:
     def proc(self, pid, ppid, comm, age=3600):
         self.table[pid] = gt.Proc(ppid, comm, start_for_age(age))
 
-    def tab(self, pid, age=3600, cwd="/w", running="", last="", sh_pid=None, pending=None):
+    def tab(self, pid, age=3600, cwd="/w", running="", sh_pid=None, pending=None):
         """A normal tab: ghostty(1) -> sh -> zsh, plus its live record."""
         self.table.setdefault(1, gt.Proc(0, "ghostty", 0))
         sh = sh_pid or pid + 1000
         self.table[sh] = gt.Proc(1, "sh", start_for_age(age))
         self.table[pid] = gt.Proc(sh, "zsh", start_for_age(age))
-        self.live(pid, cwd=cwd, running=running, last=last, pending=pending)
+        self.live(pid, cwd=cwd, running=running, pending=pending)
 
-    def live(self, pid, start=None, cwd="/w", running="", last="", pending=None):
+    def live(self, pid, start=None, cwd="/w", running="", pending=None):
         d = self.root / "live"
         d.mkdir(parents=True, exist_ok=True)
         rec = {"pid": pid, "start": self.table[pid].start if start is None else start,
-               "cwd": cwd, "running": running, "last": last}
+               "cwd": cwd, "running": running}
         if pending is not None:
             rec["pending"] = pending
         (d / f"{pid}.json").write_text(json.dumps(rec))
@@ -126,10 +126,10 @@ def test_non_interactive_claude_is_not_an_agent(env):
     assert env.snap() == [{"kind": "shell", "cwd": "/shell", "session": "", "prefill": "claude -p x"}]
 
 
-def test_shell_prefill_running_then_pending_never_last(env):
-    env.tab(100, running="nvim file", last="ls")
-    env.tab(101, age=3000, running="", last="cd ~/x")
-    env.tab(102, age=2000, running="", last="vim a", pending="vim a")
+def test_shell_prefill_running_then_pending(env):
+    env.tab(100, running="nvim file")
+    env.tab(101, age=3000, running="")
+    env.tab(102, age=2000, running="", pending="vim a")
     env.run()
     assert [e["prefill"] for e in env.snap()] == ["nvim file", "", "vim a"]
 
@@ -493,6 +493,7 @@ def test_absent_or_doubly_corrupt_snapshot_writes_marker_and_exits(rs):
 
 def test_first_window_failing_5_times_notifies_and_writes_no_marker(rs):
     tabs3(rs)
+    rs.surface_after = 1e9
     rs.results = [False] * 5
     rs.run()
     assert len(rs.calls) == 5
@@ -504,9 +505,19 @@ def test_first_window_failing_5_times_notifies_and_writes_no_marker(rs):
 
 def test_first_window_succeeding_on_a_retry_continues(rs):
     tabs3(rs)
+    rs.surface_after = 1e9
     rs.results = [False, False, True]
     rs.run()
     assert [a[1] for a in rs.calls] == ["+new-window"] * 3 + ["+new-tab"] * 2
+    assert rs.marker
+
+
+def test_first_window_timeout_with_the_shell_already_up_opens_no_second_window(rs):
+    tabs3(rs)
+    rs.results = [False]  # the call timed out, but the window opened
+    rs.run()
+    assert [a[1] for a in rs.calls] == ["+new-window", "+new-tab", "+new-tab"]
+    assert all(a[2] == "--surface-id=0x79c4059cee687806" for a in rs.calls[1:])
     assert rs.marker
 
 
@@ -550,6 +561,8 @@ def test_restore_returns_a_status_for_the_exit_code(rs):
     tabs3(rs)
     assert rs.run() == "ok"
     rs.results = [False] * 5
+    rs.surface_after = 1e9
+    rs.ids = iter(f"id{i}" for i in range(100))  # the fake surface lookup accepts id0 only
     assert rs.run(mode="force") == "no-window"
     rs.version = "Ghostty 1.3.0\n"
     assert rs.run(mode="force") == "ghostty-too-old"
@@ -570,6 +583,29 @@ def test_full_argv_of_a_tab(rs):
         "--working-directory=/c", "-e", "env", "--chdir=/c",
         "GHOSTTY_TABS_ID=id2", "GHOSTTY_TABS_RUN=", "GHOSTTY_TABS_PREFILL=nvim x",
         "GHOSTTY_TABS_NOTE=", f"ZDOTDIR={INTEGRATION}", "zsh", "-i"]
+
+
+def test_main_restore_exit_code_follows_the_status(monkeypatch):
+    status = {"value": "ok"}
+    monkeypatch.setattr(gt, "cmd_restore", lambda mode: status["value"])
+    assert gt.main(["ghostty-tabs", "restore"]) == 0
+    status["value"] = "no-window"
+    assert gt.main(["ghostty-tabs", "restore"]) == 1
+
+
+def test_non_utf8_cwd_survives_snapshot_and_reaches_the_restore_argv(env, tmp_path):
+    env.tab(100, cwd="/x")
+    start = env.table[100].start
+    (env.root / "live/100.json").write_bytes(
+        b'{"pid": 100, "start": %d, "cwd": "/tmp/a\xffb", "running": "", "pending": ""}' % start)
+    env.run()
+    snap = env.snap()
+    assert [t["kind"] for t in snap] == ["shell"]
+    r = Restore(tmp_path / "r")
+    r.dirs.add(snap[0]["cwd"])
+    r.write_snapshot(snap)
+    r.run()
+    assert b"--chdir=/tmp/a\xffb" in [os.fsencode(a) for a in r.calls[0]]
 
 
 def test_find_surface_id_reads_the_matching_process_environment(tmp_path):
@@ -601,3 +637,16 @@ def test_cwd_with_leading_dash_is_one_chdir_element():
     argv = gt.build_ghostty_argv(tab, action="+new-tab", surface_id=None, tab_id="t",
                                  integration_dir="/i", user_zdotdir="")
     assert argv[argv.index("env") + 1] == "--chdir=/w/-dash"
+
+
+def test_log_text_with_a_non_utf8_directory_is_encodable():
+    text = gt.printable("directory no longer exists: /tmp/a" + b"\xff".decode("utf-8", "surrogateescape"))
+    assert text.encode("utf-8") == b"directory no longer exists: /tmp/a\\xff"
+
+
+def test_first_window_shell_up_during_the_retry_wait_opens_no_second_window(rs):
+    tabs3(rs)
+    rs.surface_after = 2.0  # the shell starts while the restore waits 2 s
+    rs.results = [False]
+    rs.run()
+    assert [a[1] for a in rs.calls] == ["+new-window", "+new-tab", "+new-tab"]

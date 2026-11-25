@@ -34,7 +34,6 @@ typeset -g _ghostty_tabs_dir=$HOME/.local/state/ghostty-tabs/live
 typeset -g _ghostty_tabs_file=$_ghostty_tabs_dir/$$.json
 typeset -g _ghostty_tabs_tmp=$_ghostty_tabs_dir/.$$.json.tmp
 typeset -g _ghostty_tabs_running=
-typeset -g _ghostty_tabs_last=
 typeset -g _ghostty_tabs_pending=
 typeset -g _ghostty_tabs_start=
 typeset -g _ghostty_tabs_first=1
@@ -70,16 +69,15 @@ _ghostty_tabs_escape() {
 _ghostty_tabs_write() {
   emulate -L zsh
   (( ZSH_SUBSHELL )) && return 0
-  local cwd run last pending REPLY
+  local cwd run pending REPLY
   [[ -d $_ghostty_tabs_dir ]] || {
     zf_mkdir -p -m 700 ${_ghostty_tabs_dir:h} $_ghostty_tabs_dir 2>/dev/null
   }
   _ghostty_tabs_escape $PWD; cwd=$REPLY
   _ghostty_tabs_escape $_ghostty_tabs_running; run=$REPLY
-  _ghostty_tabs_escape $_ghostty_tabs_last; last=$REPLY
   _ghostty_tabs_escape $_ghostty_tabs_pending; pending=$REPLY
   {
-    print -r -- "{\"pid\": $$, \"start\": $_ghostty_tabs_start, \"cwd\": \"$cwd\", \"running\": \"$run\", \"last\": \"$last\", \"pending\": \"$pending\"}" > $_ghostty_tabs_tmp &&
+    print -r -- "{\"pid\": $$, \"start\": $_ghostty_tabs_start, \"cwd\": \"$cwd\", \"running\": \"$run\", \"pending\": \"$pending\"}" > $_ghostty_tabs_tmp &&
       zf_mv -f $_ghostty_tabs_tmp $_ghostty_tabs_file
   } 2>/dev/null
   return 0
@@ -91,7 +89,6 @@ _ghostty_tabs_chpwd() {
 
 _ghostty_tabs_preexec() {
   _ghostty_tabs_running=$1
-  _ghostty_tabs_last=$1
   _ghostty_tabs_pending=
   _ghostty_tabs_write
 }
@@ -111,7 +108,6 @@ _ghostty_tabs_precmd() {
       print -rz -- "$prefill"
     fi
     if [[ -n $run ]]; then
-      _ghostty_tabs_last=$run
       _ghostty_tabs_running=$run
       _ghostty_tabs_write
       eval "$run"
