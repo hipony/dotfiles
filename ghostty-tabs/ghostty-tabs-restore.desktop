@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=Restore Ghostty tabs
+Comment=Reopen the Ghostty tabs of the last session
+Exec=sh -c "exec ~/.local/bin/ghostty-tabs restore"
+Terminal=false
+NoDisplay=true
+X-GNOME-Autostart-enabled=true

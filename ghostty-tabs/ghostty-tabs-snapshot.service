@@ -1,0 +1,6 @@
+[Unit]
+Description=Snapshot the open Ghostty tabs
+
+[Service]
+Type=oneshot
+ExecStart=%h/.local/bin/ghostty-tabs snapshot
