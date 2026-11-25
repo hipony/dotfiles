@@ -262,3 +262,331 @@ def test_live_record_without_cwd_is_deleted(env):
     env.run()
     assert env.snap() is None
     assert not (d / "100.json").exists()
+
+
+# ---- restore ----
+
+UUID = "0b7f3c1e-1111-4222-8333-444455556666"
+INTEGRATION = "/snap/ghostty/current/share/ghostty/shell-integration/zsh"
+
+
+class Restore:
+    """Fake Ghostty, notifier and clock around gt.restore."""
+
+    def __init__(self, tmp_path):
+        self.home = tmp_path / "home"
+        self.root = self.home / ".local/state/ghostty-tabs"
+        self.root.mkdir(parents=True)
+        self.dirs = {str(self.home)}
+        self.calls = []
+        self.results = []  # per-call outcomes; default True
+        self.notes = []
+        self.logs = []
+        self.now = 0.0
+        self.sleeps = []
+        self.surface = "0x79c4059cee687806"
+        self.surface_after = 0.0  # seconds until the first tab process exists
+        self.version = "Ghostty 1.4.0\nVersion\n"
+        self.version_calls = 0
+        self.stderr = "ServiceUnknown"
+        self.env = {}
+        self.ids = iter(f"id{i}" for i in range(100))
+
+    def write_snapshot(self, tabs, name="snapshot.json"):
+        (self.root / name).write_text(json.dumps(tabs))
+
+    def _ghostty(self, argv):
+        self.calls.append(argv)
+        ok = self.results.pop(0) if self.results else True
+        return ok, "" if ok else self.stderr
+
+    def _version(self):
+        self.version_calls += 1
+        return self.version
+
+    def _sleep(self, s):
+        self.sleeps.append(s)
+        self.now += s
+
+    def _surface(self, tab_id):
+        assert tab_id == "id0"
+        return self.surface if self.now >= self.surface_after else None
+
+    def run(self, mode=None):
+        return gt.restore(
+            self.home, mode=mode, boot_id=BOOT, get_version=self._version, env=self.env,
+            isdir=lambda p: p in self.dirs, new_id=lambda: next(self.ids),
+            run_ghostty=self._ghostty, find_surface_id=self._surface,
+            notify=self.notes.append, sleep=self._sleep, monotonic=lambda: self.now,
+            log=self.logs.append)
+
+    @property
+    def marker(self):
+        return (self.root / f"restored-{BOOT}").exists()
+
+    def envs(self, i=0):
+        """The KEY=value elements after `env` in call i, as a dict."""
+        argv = self.calls[i]
+        rest = argv[argv.index("env") + 1:argv.index("zsh")]
+        return dict(x.split("=", 1) for x in rest)
+
+
+@pytest.fixture
+def rs(tmp_path):
+    return Restore(tmp_path)
+
+
+def tabs3(rs):
+    rs.dirs |= {"/a", "/b", "/c"}
+    rs.write_snapshot([
+        {"kind": "claude", "cwd": "/a", "session": UUID, "prefill": ""},
+        {"kind": "opencode", "cwd": "/b", "session": "", "prefill": ""},
+        {"kind": "shell", "cwd": "/c", "session": "", "prefill": "nvim x"},
+    ])
+
+
+def test_each_kind_gets_its_run_prefill_cwd_and_zdotdir(rs):
+    tabs3(rs)
+    rs.run()
+    assert len(rs.calls) == 3
+    for index, (argv, cwd) in enumerate(zip(rs.calls, ["/a", "/b", "/c"])):
+        assert f"--working-directory={cwd}" in argv
+        assert not any(a.startswith("--title") for a in argv)
+        assert rs.envs(index)["ZDOTDIR"] == INTEGRATION
+        assert rs.envs(index)["GHOSTTY_TABS_ID"]
+        assert argv[-2:] == ["zsh", "-i"]
+    assert rs.envs(0)["GHOSTTY_TABS_RUN"] == f"claude --resume {UUID}"
+    assert rs.envs(1)["GHOSTTY_TABS_RUN"] == "opencode"
+    assert rs.envs(2)["GHOSTTY_TABS_PREFILL"] == "nvim x"
+    assert rs.envs(2)["GHOSTTY_TABS_RUN"] == ""
+    assert rs.marker
+
+
+def test_first_tab_opens_a_window_and_the_rest_join_its_surface(rs):
+    tabs3(rs)
+    rs.run()
+    assert rs.calls[0][:2] == ["ghostty", "+new-window"]
+    assert rs.calls[0][2].startswith("--working-directory")
+    for argv in rs.calls[1:]:
+        assert argv[:3] == ["ghostty", "+new-tab", "--surface-id=0x79c4059cee687806"]
+
+
+def test_surface_wait_ends_after_10_seconds_and_tabs_open_without_surface_id(rs):
+    tabs3(rs)
+    rs.surface_after = 1e9
+    rs.run()
+    assert 10 <= rs.now < 11
+    assert [a[1] for a in rs.calls] == ["+new-window", "+new-tab", "+new-tab"]
+    assert not any(a.startswith("--surface-id") for argv in rs.calls for a in argv)
+    assert any("surface" in m for m in rs.logs)
+    assert rs.marker
+
+
+def test_surface_wait_stops_as_soon_as_the_process_appears(rs):
+    tabs3(rs)
+    rs.surface_after = 3.0
+    rs.run()
+    assert rs.now < 4
+    assert rs.calls[1][2] == "--surface-id=0x79c4059cee687806"
+
+
+def test_user_zdotdir_goes_to_ghostty_zsh_zdotdir(rs):
+    tabs3(rs)
+    rs.env = {"ZDOTDIR": "/home/u/zd"}
+    rs.run()
+    assert rs.envs(0)["GHOSTTY_ZSH_ZDOTDIR"] == "/home/u/zd"
+    assert rs.envs(0)["ZDOTDIR"] == INTEGRATION
+
+
+def test_no_zdotdir_means_no_ghostty_zsh_zdotdir_and_resources_dir_is_honoured(rs):
+    tabs3(rs)
+    rs.env = {"GHOSTTY_RESOURCES_DIR": "/opt/g"}
+    rs.run()
+    assert "GHOSTTY_ZSH_ZDOTDIR" not in rs.envs(0)
+    assert rs.envs(0)["ZDOTDIR"] == "/opt/g/shell-integration/zsh"
+
+
+def test_bad_session_id_becomes_a_shell_tab_with_the_resume_prefill(rs):
+    rs.dirs.add("/a")
+    evil = "x; rm -rf ~ #"
+    rs.write_snapshot([{"kind": "claude", "cwd": "/a", "session": evil, "prefill": ""}])
+    rs.run()
+    assert rs.envs(0)["GHOSTTY_TABS_RUN"] == ""
+    assert rs.envs(0)["GHOSTTY_TABS_PREFILL"] == f"claude --resume {evil}"
+
+
+def test_hostile_prefill_arrives_as_one_raw_argv_element(rs):
+    rs.dirs.add("/a")
+    text = 'echo "a\\"b" \'q\' $(id) ; ls\nnext line'
+    rs.write_snapshot([{"kind": "shell", "cwd": "/a", "session": "", "prefill": text}])
+    rs.run()
+    assert f"GHOSTTY_TABS_PREFILL={text}" in rs.calls[0]
+
+
+def test_missing_cwd_opens_in_home_with_a_note(rs):
+    rs.write_snapshot([{"kind": "shell", "cwd": "/gone", "session": "", "prefill": "ls"}])
+    rs.run()
+    assert f"--working-directory={rs.home}" in rs.calls[0]
+    assert "/gone" in rs.envs(0)["GHOSTTY_TABS_NOTE"]
+    assert rs.envs(0)["GHOSTTY_TABS_PREFILL"] == "ls"
+
+
+def test_missing_cwd_of_an_agent_tab_prefills_the_resume_command(rs):
+    rs.write_snapshot([
+        {"kind": "claude", "cwd": "/gone", "session": UUID, "prefill": ""},
+        {"kind": "opencode", "cwd": "/gone", "session": "", "prefill": ""},
+    ])
+    rs.run()
+    assert rs.envs(0)["GHOSTTY_TABS_RUN"] == ""
+    assert rs.envs(0)["GHOSTTY_TABS_PREFILL"] == f"claude --resume {UUID}"
+    assert rs.envs(1)["GHOSTTY_TABS_RUN"] == ""
+    assert rs.envs(1)["GHOSTTY_TABS_PREFILL"] == "opencode"
+
+
+def test_existing_marker_means_no_ghostty_call_and_force_ignores_it(rs):
+    tabs3(rs)
+    (rs.root / f"restored-{BOOT}").write_text("")
+    rs.run()
+    assert rs.calls == []
+    rs.run(mode="force")
+    assert len(rs.calls) == 3
+
+
+def test_skip_discards_the_snapshot_and_a_later_force_opens_nothing(rs):
+    tabs3(rs)
+    rs.write_snapshot([], name="snapshot.prev.json")
+    rs.run(mode="skip")
+    assert rs.calls == []
+    assert not (rs.root / "snapshot.json").exists()
+    assert not (rs.root / "snapshot.prev.json").exists()
+    assert (rs.root / "snapshot.skipped.json").exists()
+    assert rs.marker
+    rs.run(mode="force")
+    assert rs.calls == []
+
+
+def test_corrupt_snapshot_falls_back_to_prev_and_logs(rs):
+    rs.dirs.add("/p")
+    (rs.root / "snapshot.json").write_text("{not json")
+    rs.write_snapshot([{"kind": "shell", "cwd": "/p", "session": "", "prefill": ""}],
+                      name="snapshot.prev.json")
+    rs.run()
+    assert "--working-directory=/p" in rs.calls[0]
+    assert rs.logs
+
+
+def test_absent_or_doubly_corrupt_snapshot_writes_marker_and_exits(rs):
+    rs.run()
+    assert rs.calls == [] and rs.marker
+    (rs.root / f"restored-{BOOT}").unlink()
+    (rs.root / "snapshot.json").write_text("[")
+    (rs.root / "snapshot.prev.json").write_text("")
+    rs.logs.clear()
+    rs.run()
+    assert rs.calls == [] and rs.marker
+    assert any("both snapshot files are bad" in m for m in rs.logs)
+
+
+def test_first_window_failing_5_times_notifies_and_writes_no_marker(rs):
+    tabs3(rs)
+    rs.results = [False] * 5
+    rs.run()
+    assert len(rs.calls) == 5
+    assert all(a[1] == "+new-window" for a in rs.calls)
+    assert rs.sleeps == [2, 2, 2, 2]
+    assert rs.notes and rs.logs
+    assert not rs.marker
+
+
+def test_first_window_succeeding_on_a_retry_continues(rs):
+    tabs3(rs)
+    rs.results = [False, False, True]
+    rs.run()
+    assert [a[1] for a in rs.calls] == ["+new-window"] * 3 + ["+new-tab"] * 2
+    assert rs.marker
+
+
+def test_failed_new_tab_is_logged_and_the_next_tab_continues(rs):
+    tabs3(rs)
+    rs.results = [True, False, True]
+    rs.run()
+    assert len(rs.calls) == 3
+    assert rs.logs
+    assert len(rs.notes) == 1 and "1" in rs.notes[0]
+    assert rs.marker
+
+
+def test_ghostty_before_1_4_0_notifies_and_writes_no_marker(rs):
+    tabs3(rs)
+    rs.version = "Ghostty 1.3.9\n"
+    rs.run()
+    assert rs.calls == []
+    assert rs.notes and rs.logs
+    assert not rs.marker
+
+
+def test_failed_calls_log_the_ghostty_stderr(rs):
+    tabs3(rs)
+    rs.results = [False, True, False]
+    rs.run()
+    assert sum("ServiceUnknown" in m for m in rs.logs) == 2
+
+
+def test_version_is_not_looked_up_when_marker_exists_or_on_skip(rs):
+    tabs3(rs)
+    (rs.root / f"restored-{BOOT}").write_text("")
+    rs.run()
+    rs.run(mode="skip")
+    assert rs.version_calls == 0
+    rs.run(mode="force")
+    assert rs.version_calls == 1
+
+
+def test_restore_returns_a_status_for_the_exit_code(rs):
+    tabs3(rs)
+    assert rs.run() == "ok"
+    rs.results = [False] * 5
+    assert rs.run(mode="force") == "no-window"
+    rs.version = "Ghostty 1.3.0\n"
+    assert rs.run(mode="force") == "ghostty-too-old"
+
+
+def test_unparsable_version_counts_as_too_old(rs):
+    tabs3(rs)
+    rs.version = ""
+    assert rs.run() == "ghostty-too-old"
+    assert rs.calls == [] and not rs.marker
+
+
+def test_full_argv_of_a_tab(rs):
+    tabs3(rs)
+    rs.run()
+    assert rs.calls[2] == [
+        "ghostty", "+new-tab", "--surface-id=0x79c4059cee687806",
+        "--working-directory=/c", "-e", "env",
+        "GHOSTTY_TABS_ID=id2", "GHOSTTY_TABS_RUN=", "GHOSTTY_TABS_PREFILL=nvim x",
+        "GHOSTTY_TABS_NOTE=", f"ZDOTDIR={INTEGRATION}", "zsh", "-i"]
+
+
+def test_find_surface_id_reads_the_matching_process_environment(tmp_path):
+    def environ(pid, *items):
+        d = tmp_path / str(pid)
+        d.mkdir()
+        (d / "environ").write_bytes(b"\0".join(i.encode() for i in items) + b"\0")
+
+    environ(7, "HOME=/h", "GHOSTTY_TABS_ID=other", "GHOSTTY_SURFACE_ID=0x1")
+    environ(8, "GHOSTTY_TABS_ID=abc", "GHOSTTY_SURFACE_ID=0x79c4059cee687806")
+    (tmp_path / "self").mkdir()
+    assert gt.find_surface_id("abc", proc_root=str(tmp_path)) == "0x79c4059cee687806"
+    assert gt.find_surface_id("zzz", proc_root=str(tmp_path)) is None
+
+
+def test_run_ghostty_timeout_does_not_log_the_argv(monkeypatch):
+    def timeout(argv, **kwargs):
+        raise gt.subprocess.TimeoutExpired(argv, 30)
+
+    monkeypatch.setattr(gt.subprocess, "run", timeout)
+    ok, err = gt.run_ghostty(["ghostty", "-e", "env", "GHOSTTY_TABS_PREFILL=export TOKEN=secret"])
+    assert not ok
+    assert "secret" not in err
+    assert "TimeoutExpired" in err

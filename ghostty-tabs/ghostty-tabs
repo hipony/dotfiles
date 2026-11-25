@@ -3,14 +3,24 @@
 import json
 import os
 import re
+import secrets
 import subprocess
 import sys
+import time
 from collections import deque
 from pathlib import Path
 from typing import NamedTuple
 
 MIN_TAB_AGE_SECONDS = 600
 RECORD_NAME = re.compile(r"\d+\.json")
+SESSION_ID = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
+MIN_GHOSTTY = (1, 4, 0)
+DEFAULT_RESOURCES_DIR = "/snap/ghostty/current/share/ghostty"
+WINDOW_TRIES = 5
+WINDOW_RETRY_SECONDS = 2
+SURFACE_WAIT_SECONDS = 10
+SURFACE_POLL_SECONDS = 0.5
+STDERR_LOG_LIMIT = 500
 
 
 class Proc(NamedTuple):
@@ -166,11 +176,232 @@ def cmd_snapshot():
     )
 
 
+def parse_ghostty_version(text):
+    """Return (major, minor, patch) from the first line of `ghostty --version`, or None."""
+    m = re.match(r"Ghostty (\d+)\.(\d+)\.(\d+)", text)
+    return tuple(int(x) for x in m.groups()) if m else None
+
+
+def load_tabs(root, log):
+    """Return the tab entries to restore, or None when there is nothing to restore."""
+    for name in ("snapshot.json", "snapshot.prev.json"):
+        path = root / name
+        if not path.exists():
+            if name == "snapshot.json":
+                return None  # absent: no fallback
+            continue
+        try:
+            tabs = json.loads(path.read_text())
+            if isinstance(tabs, list):
+                return [t for t in tabs if isinstance(t, dict)]
+        except (OSError, ValueError):
+            pass
+        log(f"{name} cannot be parsed")
+        if name == "snapshot.json":
+            log("falling back to snapshot.prev.json")
+    log("both snapshot files are bad")
+    return None
+
+
+def resolve_tab(tab, home, isdir):
+    """Return {cwd, run, prefill, note} for one tab entry."""
+    kind = tab.get("kind")
+    session = str(tab.get("session") or "")
+    prefill = str(tab.get("prefill") or "")
+    cwd = tab.get("cwd")
+    run = ""
+    if kind == "claude":
+        command = f"claude --resume {session}".rstrip()
+        if SESSION_ID.fullmatch(session):
+            run = command
+        else:
+            prefill = command
+    elif kind == "opencode":
+        run = "opencode"
+    note = ""
+    if not (isinstance(cwd, str) and isdir(cwd)):
+        note = f"directory no longer exists: {cwd}"
+        cwd = str(home)
+        if run:  # an agent must not start in the wrong directory
+            prefill, run = run, ""
+    return {"cwd": cwd, "run": run, "prefill": prefill, "note": note}
+
+
+def build_ghostty_argv(tab, *, action, surface_id, tab_id, integration_dir, user_zdotdir):
+    """Return the Ghostty argv that opens one resolved tab. action: +new-window or +new-tab."""
+    argv = ["ghostty", action]
+    if surface_id:
+        argv.append(f"--surface-id={surface_id}")
+    argv.append(f"--working-directory={tab['cwd']}")
+    values = [("GHOSTTY_TABS_ID", tab_id), ("GHOSTTY_TABS_RUN", tab["run"]),
+              ("GHOSTTY_TABS_PREFILL", tab["prefill"]), ("GHOSTTY_TABS_NOTE", tab["note"]),
+              ("ZDOTDIR", integration_dir)]
+    if user_zdotdir:
+        values.append(("GHOSTTY_ZSH_ZDOTDIR", user_zdotdir))
+    # An argv element cannot hold NUL; each value is otherwise raw.
+    argv += ["-e", "env"] + [f"{k}={v}".replace("\0", "") for k, v in values] + ["zsh", "-i"]
+    return argv
+
+
+def restore(home, *, mode, boot_id, get_version, env, isdir, new_id, run_ghostty,
+            find_surface_id, notify, sleep, monotonic, log):
+    """Open one Ghostty tab for each tab entry of snapshot.json. mode: None, "force" or "skip".
+
+    Return "ok", "ghostty-too-old" or "no-window".
+    """
+    root = state_root(home)
+    marker = root / f"restored-{boot_id}"
+
+    def write_marker():
+        root.mkdir(mode=0o700, parents=True, exist_ok=True)
+        marker.write_text("")
+
+    if mode == "skip":
+        root.mkdir(mode=0o700, parents=True, exist_ok=True)
+        if (root / "snapshot.json").exists():
+            os.replace(root / "snapshot.json", root / "snapshot.skipped.json")
+        (root / "snapshot.prev.json").unlink(missing_ok=True)
+        write_marker()
+        return "ok"
+    if marker.exists() and mode != "force":
+        return "ok"
+    version_text = get_version()
+    version = parse_ghostty_version(version_text)
+    if version is None or version < MIN_GHOSTTY:
+        msg = "Ghostty 1.4.0 or later is required for restore"
+        log(f"{msg} (found {version_text.splitlines()[0] if version_text else 'none'})")
+        notify(msg)
+        return "ghostty-too-old"
+    tabs = load_tabs(root, log)
+    if not tabs:
+        log("no tabs to restore")
+        write_marker()
+        return "ok"
+
+    resources = env.get("GHOSTTY_RESOURCES_DIR") or DEFAULT_RESOURCES_DIR
+    common = dict(integration_dir=f"{resources}/shell-integration/zsh",
+                  user_zdotdir=env.get("ZDOTDIR", ""))
+    surface_id = None
+    failed = 0
+    for index, tab in enumerate(tabs):
+        resolved = resolve_tab(tab, home, isdir)
+        if resolved["note"]:
+            log(resolved["note"])
+        tab_id = new_id()
+        if index == 0:
+            argv = build_ghostty_argv(resolved, action="+new-window", surface_id=None,
+                                      tab_id=tab_id, **common)
+            for attempt in range(WINDOW_TRIES):
+                ok, err = run_ghostty(argv)
+                if ok:
+                    break
+                log(f"+new-window failed (try {attempt + 1} of {WINDOW_TRIES}): {err}")
+                if attempt < WINDOW_TRIES - 1:
+                    sleep(WINDOW_RETRY_SECONDS)
+            else:
+                msg = "Ghostty did not open a window; run ghostty-tabs restore"
+                log(msg)
+                notify(msg)
+                return "no-window"
+            deadline = monotonic() + SURFACE_WAIT_SECONDS
+            while True:
+                surface_id = find_surface_id(tab_id)
+                if surface_id or monotonic() >= deadline:
+                    break
+                sleep(SURFACE_POLL_SECONDS)
+            if not surface_id:
+                log("surface ID of the first window not found; tabs open without --surface-id")
+        else:
+            argv = build_ghostty_argv(resolved, action="+new-tab", surface_id=surface_id,
+                                      tab_id=tab_id, **common)
+            ok, err = run_ghostty(argv)
+            if not ok:
+                failed += 1
+                log(f"+new-tab failed for {tab.get('cwd')}: {err}")
+    write_marker()
+    if failed:
+        notify(f"{failed} tab(s) failed to restore")
+    return "ok"
+
+
+def read_ghostty_version():
+    try:
+        result = subprocess.run(["ghostty", "--version"], capture_output=True, text=True,
+                                timeout=30)
+    except (OSError, subprocess.SubprocessError):
+        return ""
+    return result.stdout
+
+
+def run_ghostty(argv):
+    """Run a Ghostty argv. Return (succeeded, stderr text trimmed for the log)."""
+    try:
+        result = subprocess.run(argv, capture_output=True, text=True, errors="replace",
+                                timeout=30)
+    except subprocess.TimeoutExpired as exc:
+        # str(exc) holds the argv, which holds the prefill: keep it out of the log.
+        return False, f"TimeoutExpired after {exc.timeout} s"
+    except OSError as exc:
+        return False, f"{type(exc).__name__}: {exc.strerror}"
+    except subprocess.SubprocessError as exc:
+        return False, type(exc).__name__
+    return result.returncode == 0, result.stderr.strip()[:STDERR_LOG_LIMIT]
+
+
+def find_surface_id(tab_id, proc_root="/proc"):
+    """Return GHOSTTY_SURFACE_ID of the process whose environment holds GHOSTTY_TABS_ID=tab_id."""
+    want = f"GHOSTTY_TABS_ID={tab_id}".encode()
+    with os.scandir(proc_root) as entries:
+        names = [e.name for e in entries if e.name.isdigit()]
+    for name in names:
+        if int(name) == os.getpid():
+            continue
+        try:
+            items = (Path(proc_root) / name / "environ").read_bytes().split(b"\0")
+        except OSError:
+            continue
+        if want in items:
+            for item in items:
+                if item.startswith(b"GHOSTTY_SURFACE_ID="):
+                    return item.split(b"=", 1)[1].decode()
+    return None
+
+
+def notify_send(message):
+    try:
+        subprocess.run(["notify-send", "ghostty-tabs", message], timeout=10)
+    except (OSError, subprocess.SubprocessError):
+        pass
+
+
+def cmd_restore(mode):
+    home = Path.home()
+    log_path = state_root(home) / "restore.log"
+
+    def log(message):
+        print(message, file=sys.stderr)
+        try:
+            log_path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+            with open(log_path, "a") as f:
+                f.write(f"{time.strftime('%F %T')} {message}\n")
+        except OSError:
+            pass
+
+    return restore(
+        home, mode=mode, boot_id=read_boot_id(), get_version=read_ghostty_version,
+        env=os.environ, isdir=os.path.isdir, new_id=lambda: secrets.token_hex(8),
+        run_ghostty=run_ghostty, find_surface_id=find_surface_id, notify=notify_send,
+        sleep=time.sleep, monotonic=time.monotonic, log=log)
+
+
 def main(argv):
     if argv[1:] == ["snapshot"]:
         cmd_snapshot()
         return 0
-    print("usage: ghostty-tabs snapshot", file=sys.stderr)
+    if argv[1:2] == ["restore"] and argv[2:] in ([], ["--force"], ["--skip"]):
+        status = cmd_restore({"--force": "force", "--skip": "skip"}.get(argv[2] if argv[2:] else ""))
+        return 0 if status == "ok" else 1
+    print("usage: ghostty-tabs snapshot | restore [--force | --skip]", file=sys.stderr)
     return 2
 
 
