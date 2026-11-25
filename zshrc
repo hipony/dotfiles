@@ -1,4 +1,4 @@
-export PATH=$HOME/.cargo/bin:/usr/local/bin:$PATH
+export PATH=$HOME/.cargo/bin:/usr/local/bin:$HOME/.local/bin:$PATH
 
 export ZSH="$HOME/.oh-my-zsh"
 
@@ -16,3 +16,4 @@ export EDITOR='vim'
 # User configuration
 # ...
 [ -f ~/.zshrc.local ] && source ~/.zshrc.local
+
