@@ -11,6 +11,7 @@ DISABLE_COMPFIX="true"
 plugins=(git zsh-autosuggestions zsh-syntax-highlighting)
 
 source $ZSH/oh-my-zsh.sh
+source "${${(%):-%x}:A:h}/ghostty-tabs/tabs.zsh"
 export EDITOR='vim'
 # User configuration
 # ...
