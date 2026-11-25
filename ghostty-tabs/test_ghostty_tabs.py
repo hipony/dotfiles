@@ -37,19 +37,21 @@ class Env:
     def proc(self, pid, ppid, comm, age=3600):
         self.table[pid] = gt.Proc(ppid, comm, start_for_age(age))
 
-    def tab(self, pid, age=3600, cwd="/w", running="", last="", sh_pid=None):
+    def tab(self, pid, age=3600, cwd="/w", running="", last="", sh_pid=None, pending=None):
         """A normal tab: ghostty(1) -> sh -> zsh, plus its live record."""
         self.table.setdefault(1, gt.Proc(0, "ghostty", 0))
         sh = sh_pid or pid + 1000
         self.table[sh] = gt.Proc(1, "sh", start_for_age(age))
         self.table[pid] = gt.Proc(sh, "zsh", start_for_age(age))
-        self.live(pid, cwd=cwd, running=running, last=last)
+        self.live(pid, cwd=cwd, running=running, last=last, pending=pending)
 
-    def live(self, pid, start=None, cwd="/w", running="", last=""):
+    def live(self, pid, start=None, cwd="/w", running="", last="", pending=None):
         d = self.root / "live"
         d.mkdir(parents=True, exist_ok=True)
         rec = {"pid": pid, "start": self.table[pid].start if start is None else start,
                "cwd": cwd, "running": running, "last": last}
+        if pending is not None:
+            rec["pending"] = pending
         (d / f"{pid}.json").write_text(json.dumps(rec))
 
     def claude_rec(self, pid, session, cwd, interactive=True):
@@ -124,12 +126,12 @@ def test_non_interactive_claude_is_not_an_agent(env):
     assert env.snap() == [{"kind": "shell", "cwd": "/shell", "session": "", "prefill": "claude -p x"}]
 
 
-def test_shell_prefill_running_then_last(env):
+def test_shell_prefill_running_then_pending_never_last(env):
     env.tab(100, running="nvim file", last="ls")
-    env.tab(101, age=3000, running="", last="make test")
+    env.tab(101, age=3000, running="", last="cd ~/x")
+    env.tab(102, age=2000, running="", last="vim a", pending="vim a")
     env.run()
-    by_prefill = sorted(e["prefill"] for e in env.snap())
-    assert by_prefill == ["make test", "nvim file"]
+    assert [e["prefill"] for e in env.snap()] == ["nvim file", "", "vim a"]
 
 
 def test_only_digit_json_files_are_records(env):

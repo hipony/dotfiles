@@ -179,14 +179,15 @@ def test_restored_tab_runs_command_once_with_live_record(sh):
     assert p[0]["last"] == run
 
 
-def test_restored_tab_prefill_in_last_and_buffer(sh):
+def test_restored_tab_prefill_in_pending_and_buffer(sh):
     sh.fake_parent()
     hostile = '-rf \\ \\n "q" $(touch PWNED) ; ls\nnext line'
     r = sh.run("IFS= read -rzd '' buf\nprint -r -- \"$buf\" > $PROBE_OUT/buf\n",
                env={"GHOSTTY_TABS_ID": "x", "GHOSTTY_TABS_RUN": "",
                     "GHOSTTY_TABS_PREFILL": hostile, "GHOSTTY_TABS_NOTE": ""})
     p = sh.prompts()
-    assert p[0]["last"] == hostile
+    assert p[0]["pending"] == hostile
+    assert p[-1]["pending"] == ""  # the next command clears it
     assert (sh.out / "buf").read_text().rstrip("\n") == hostile
     assert not (sh.cwd / "PWNED").exists()
 

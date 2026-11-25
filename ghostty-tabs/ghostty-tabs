@@ -137,7 +137,7 @@ def build_tabs(live_records, table, claude_dir, proc_cwd):
             tabs.append({**agent, "prefill": ""})
         else:
             tabs.append({"kind": "shell", "cwd": rec["cwd"], "session": "",
-                         "prefill": rec.get("running") or rec.get("last") or ""})
+                         "prefill": rec.get("running") or rec.get("pending") or ""})
     return tabs
 
 
