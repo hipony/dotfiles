@@ -1,2 +1,5 @@
 # Ghostty config, owned by hipony-dotfiles. install.sh links it to
 # ~/.config/ghostty/config.ghostty. The Ghostty tab restore needs no setting here.
+
+# Magnolia (hipony/magnolia-theme); install.sh links it to ~/.config/ghostty/themes/Magnolia.
+theme = Magnolia

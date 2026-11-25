@@ -49,6 +49,31 @@ link "$DIR/ghostty/config.ghostty" ~/.config/ghostty/config.ghostty
 link "$DIR/ghostty/com.mitchellh.ghostty.service" ~/.local/share/dbus-1/services/com.mitchellh.ghostty.service
 link "$DIR/ghostty/app-com.mitchellh.ghostty.service" ~/.config/systemd/user/app-com.mitchellh.ghostty.service
 
+# Magnolia theme for Ghostty and OpenCode
+MAGNOLIA="$HOME/dev/magnolia-theme"
+if [ -d "$MAGNOLIA" ]; then
+  git -C "$MAGNOLIA" pull --ff-only
+else
+  git clone https://github.com/hipony/magnolia-theme.git "$MAGNOLIA"
+fi
+link "$MAGNOLIA/exports/ghostty/Magnolia.ghostty" ~/.config/ghostty/themes/Magnolia
+link "$MAGNOLIA/exports/opencode/magnolia.json" ~/.config/opencode/themes/magnolia.json
+# Select the theme in OpenCode; keep every other key of cli.json.
+python3 - "$HOME/.config/opencode/cli.json" <<'PY'
+import json, os, sys
+path = sys.argv[1]
+data = {}
+if os.path.exists(path):
+    with open(path) as f:
+        data = json.load(f)
+data["theme"] = {**data.get("theme", {}), "name": "magnolia"}
+tmp = path + ".tmp"
+with open(tmp, "w") as f:
+    json.dump(data, f, indent=2)
+    f.write("\n")
+os.replace(tmp, path)
+PY
+
 mkdir -p ~/.local/state/ghostty-tabs
 chmod 700 ~/.local/state/ghostty-tabs
 

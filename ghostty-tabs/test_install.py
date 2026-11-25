@@ -2,6 +2,7 @@
 and stubs for git, snap, systemctl, curl and busctl on PATH. The stubs append
 their command line to $STUB_LOG."""
 import configparser
+import json
 import os
 import shutil
 import stat
@@ -105,13 +106,13 @@ def test_state_dir_mode_is_fixed_when_it_existed(sb):
 
 def test_plugins_cloned_only_when_missing(sb):
     assert sb.run().returncode == 0
-    clones = [c for c in sb.calls() if c.startswith("git clone")]
+    clones = [c for c in sb.calls() if c.startswith("git clone") and "oh-my-zsh" in c]
     assert len(clones) == 2
     assert any("zsh-autosuggestions" in c for c in clones)
     assert any("zsh-syntax-highlighting" in c for c in clones)
     sb.log.write_text("")
     assert sb.run().returncode == 0
-    assert not [c for c in sb.calls() if c.startswith("git clone")]
+    assert not [c for c in sb.calls() if c.startswith("git clone") and "oh-my-zsh" in c]
 
 
 def test_units_and_autostart_use_paths_without_path_lookup():
@@ -144,3 +145,40 @@ def test_ghostty_files_use_absolute_snap_path_and_dbus_names():
     unit.read(REPO / "ghostty/app-com.mitchellh.ghostty.service")
     assert unit["Service"]["ExecStart"] == exe
     assert unit["Service"]["BusName"] == "com.mitchellh.ghostty"
+
+
+def magnolia(sb):
+    return sb.home / "dev/magnolia-theme"
+
+
+def test_magnolia_theme_is_cloned_when_missing_and_linked(sb):
+    assert sb.run().returncode == 0
+    clone = magnolia(sb)
+    assert f"git clone https://github.com/hipony/magnolia-theme.git {clone}" in sb.calls()
+    assert os.readlink(sb.link(".config/ghostty/themes/Magnolia")) == str(clone / "exports/ghostty/Magnolia.ghostty")
+    assert os.readlink(sb.link(".config/opencode/themes/magnolia.json")) == str(clone / "exports/opencode/magnolia.json")
+
+
+def test_magnolia_theme_is_pulled_when_present(sb):
+    magnolia(sb).mkdir(parents=True)
+    assert sb.run().returncode == 0
+    assert f"git -C {magnolia(sb)} pull --ff-only" in sb.calls()
+    assert not any(c.startswith("git clone https://github.com/hipony/magnolia-theme") for c in sb.calls())
+
+
+def test_opencode_theme_is_selected_and_other_keys_stay(sb):
+    cli = sb.link(".config/opencode/cli.json")
+    cli.parent.mkdir(parents=True)
+    cli.write_text(json.dumps({"theme": {"name": "system"}, "plugins": ["-x"], "animations": True}))
+    assert sb.run().returncode == 0
+    data = json.loads(cli.read_text())
+    assert data == {"theme": {"name": "magnolia"}, "plugins": ["-x"], "animations": True}
+
+
+def test_opencode_cli_json_is_created_when_missing(sb):
+    assert sb.run().returncode == 0
+    assert json.loads(sb.link(".config/opencode/cli.json").read_text())["theme"] == {"name": "magnolia"}
+
+
+def test_ghostty_config_selects_magnolia():
+    assert "theme = Magnolia" in (REPO / "ghostty/config.ghostty").read_text().splitlines()
