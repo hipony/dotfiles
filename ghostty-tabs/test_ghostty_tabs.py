@@ -327,7 +327,7 @@ class Restore:
     def envs(self, i=0):
         """The KEY=value elements after `env` in call i, as a dict."""
         argv = self.calls[i]
-        rest = argv[argv.index("env") + 1:argv.index("zsh")]
+        rest = argv[argv.index("env") + 2:argv.index("zsh")]  # after "env --chdir=<cwd>"
         return dict(x.split("=", 1) for x in rest)
 
 
@@ -351,6 +351,8 @@ def test_each_kind_gets_its_run_prefill_cwd_and_zdotdir(rs):
     assert len(rs.calls) == 3
     for index, (argv, cwd) in enumerate(zip(rs.calls, ["/a", "/b", "/c"])):
         assert f"--working-directory={cwd}" in argv
+        # +new-tab ignores --working-directory (Ghostty 1.4.0); env -C sets it.
+        assert argv[argv.index("env") + 1] == f"--chdir={cwd}"
         assert not any(a.startswith("--title") for a in argv)
         assert rs.envs(index)["ZDOTDIR"] == INTEGRATION
         assert rs.envs(index)["GHOSTTY_TABS_ID"]
@@ -563,7 +565,7 @@ def test_full_argv_of_a_tab(rs):
     rs.run()
     assert rs.calls[2] == [
         "ghostty", "+new-tab", "--surface-id=0x79c4059cee687806",
-        "--working-directory=/c", "-e", "env",
+        "--working-directory=/c", "-e", "env", "--chdir=/c",
         "GHOSTTY_TABS_ID=id2", "GHOSTTY_TABS_RUN=", "GHOSTTY_TABS_PREFILL=nvim x",
         "GHOSTTY_TABS_NOTE=", f"ZDOTDIR={INTEGRATION}", "zsh", "-i"]
 
@@ -590,3 +592,10 @@ def test_run_ghostty_timeout_does_not_log_the_argv(monkeypatch):
     assert not ok
     assert "secret" not in err
     assert "TimeoutExpired" in err
+
+
+def test_cwd_with_leading_dash_is_one_chdir_element():
+    tab = {"cwd": "/w/-dash", "run": "", "prefill": "", "note": ""}
+    argv = gt.build_ghostty_argv(tab, action="+new-tab", surface_id=None, tab_id="t",
+                                 integration_dir="/i", user_zdotdir="")
+    assert argv[argv.index("env") + 1] == "--chdir=/w/-dash"

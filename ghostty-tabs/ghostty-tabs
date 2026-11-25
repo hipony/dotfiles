@@ -238,8 +238,12 @@ def build_ghostty_argv(tab, *, action, surface_id, tab_id, integration_dir, user
               ("ZDOTDIR", integration_dir)]
     if user_zdotdir:
         values.append(("GHOSTTY_ZSH_ZDOTDIR", user_zdotdir))
-    # An argv element cannot hold NUL; each value is otherwise raw.
-    argv += ["-e", "env"] + [f"{k}={v}".replace("\0", "") for k, v in values] + ["zsh", "-i"]
+    # +new-tab ignores --working-directory (Ghostty 1.4.0), so env --chdir sets
+    # the directory of every tab. One "--chdir=" element: a directory name that
+    # starts with "-" is not read as an option. An argv element cannot hold NUL;
+    # each value is otherwise raw.
+    argv += ["-e", "env", "--chdir=" + tab["cwd"].replace("\0", "")]
+    argv += [f"{k}={v}".replace("\0", "") for k, v in values] + ["zsh", "-i"]
     return argv
 
 
