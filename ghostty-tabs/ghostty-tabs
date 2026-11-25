@@ -1,0 +1,178 @@
+#!/usr/bin/env python3
+"""Save and restore the tabs of Ghostty. See docs/specs/2026-11-25-ghostty-tab-restore-design.md."""
+import json
+import os
+import re
+import subprocess
+import sys
+from collections import deque
+from pathlib import Path
+from typing import NamedTuple
+
+MIN_TAB_AGE_SECONDS = 600
+RECORD_NAME = re.compile(r"\d+\.json")
+
+
+class Proc(NamedTuple):
+    ppid: int
+    comm: str
+    start: int
+
+
+def state_root(home):
+    return Path(home) / ".local/state/ghostty-tabs"
+
+
+def read_process_table():
+    """Return {pid: Proc} from /proc."""
+    table = {}
+    for entry in os.scandir("/proc"):
+        if not entry.name.isdigit():
+            continue
+        try:
+            with open(f"/proc/{entry.name}/stat") as f:
+                stat = f.read()
+        except OSError:
+            continue
+        # comm sits in parentheses and may contain spaces; split after the last ")".
+        comm = stat[stat.index("(") + 1:stat.rindex(")")]
+        fields = stat[stat.rindex(")") + 2:].split()
+        table[int(entry.name)] = Proc(ppid=int(fields[1]), comm=comm, start=int(fields[19]))
+    return table
+
+
+def read_system_state():
+    result = subprocess.run(["systemctl", "is-system-running"], capture_output=True, text=True)
+    return result.stdout.strip()
+
+
+def read_uptime():
+    return float(Path("/proc/uptime").read_text().split()[0])
+
+
+def read_boot_id():
+    return Path("/proc/sys/kernel/random/boot_id").read_text().strip()
+
+
+def write_json_atomic(path, data):
+    tmp = path.with_name("." + path.name + ".tmp")  # never <digits>.json
+    tmp.write_text(json.dumps(data))
+    os.replace(tmp, path)
+
+
+def read_live_records(live_dir, table):
+    """Return the records of live tab shells; delete the records of dead ones."""
+    records = []
+    if not live_dir.is_dir():
+        return records
+    for path in sorted(live_dir.iterdir()):
+        if not RECORD_NAME.fullmatch(path.name):
+            continue
+        try:
+            rec = json.loads(path.read_text())
+            proc = table.get(rec["pid"])
+            alive = (proc is not None and proc.start == rec["start"]
+                     and isinstance(rec["cwd"], str))
+        except (OSError, ValueError, KeyError, TypeError):
+            alive = False
+        if alive:
+            records.append(rec)
+        else:
+            path.unlink(missing_ok=True)
+    return records
+
+
+def read_claude_record(claude_dir, pid, proc):
+    try:
+        rec = json.loads((claude_dir / f"{pid}.json").read_text())
+    except (OSError, ValueError):
+        return None
+    if not isinstance(rec, dict) or rec.get("kind") != "interactive":
+        return None
+    if str(rec.get("procStart", proc.start)) != str(proc.start):
+        return None
+    if not (isinstance(rec.get("cwd"), str) and isinstance(rec.get("sessionId"), str)):
+        return None
+    return rec
+
+
+def find_agent(shell_pid, table, claude_dir, proc_cwd):
+    """Return the tab entry fields of the agent nearest to the shell, or None."""
+    children = {}
+    for pid, proc in table.items():
+        children.setdefault(proc.ppid, []).append(pid)
+    queue = deque(sorted(children.get(shell_pid, [])))
+    while queue:
+        pid = queue.popleft()
+        proc = table[pid]
+        if proc.comm == "claude":
+            rec = read_claude_record(claude_dir, pid, proc)
+            if rec is not None:
+                return {"kind": "claude", "cwd": rec["cwd"], "session": rec["sessionId"]}
+        elif proc.comm == "opencode":
+            try:
+                return {"kind": "opencode", "cwd": proc_cwd(pid), "session": ""}
+            except OSError:  # the process exited after the table read
+                pass
+        queue.extend(sorted(children.get(pid, [])))
+    return None
+
+
+def build_tabs(live_records, table, claude_dir, proc_cwd):
+    """Return the tab entries, in tab open order."""
+    tabs = []
+    for rec in sorted(live_records, key=lambda r: r["start"]):
+        agent = find_agent(rec["pid"], table, claude_dir, proc_cwd)
+        if agent is not None:
+            tabs.append({**agent, "prefill": ""})
+        else:
+            tabs.append({"kind": "shell", "cwd": rec["cwd"], "session": "",
+                         "prefill": rec.get("running") or rec.get("last") or ""})
+    return tabs
+
+
+def snapshot(home, *, table, proc_cwd, system_state, boot_id, uptime, clk_tck):
+    """Write snapshot.json unless a blocking condition holds. Return True on write."""
+    root = state_root(home)
+    # Delete stale live records even when no write follows.
+    live = read_live_records(root / "live", table)
+    if system_state == "stopping" or not live:
+        return False
+    oldest_age = uptime - min(r["start"] for r in live) / clk_tck
+    if not (root / f"restored-{boot_id}").exists() and oldest_age < MIN_TAB_AGE_SECONDS:
+        return False
+    tabs = build_tabs(live, table, Path(home) / ".claude/sessions", proc_cwd)
+    root.mkdir(mode=0o700, parents=True, exist_ok=True)
+    current = root / "snapshot.json"
+    if current.exists():
+        # Link, not move: snapshot.json must exist at every moment.
+        prev_tmp = root / ".snapshot.prev.json.tmp"
+        prev_tmp.unlink(missing_ok=True)
+        os.link(current, prev_tmp)
+        os.replace(prev_tmp, root / "snapshot.prev.json")
+    write_json_atomic(current, tabs)
+    return True
+
+
+def cmd_snapshot():
+    snapshot(
+        Path.home(),
+        table=read_process_table(),
+        proc_cwd=lambda pid: os.readlink(f"/proc/{pid}/cwd"),
+        system_state=read_system_state(),
+        boot_id=read_boot_id(),
+        uptime=read_uptime(),
+        clk_tck=os.sysconf("SC_CLK_TCK"),
+    )
+
+
+def main(argv):
+    if argv[1:] == ["snapshot"]:
+        cmd_snapshot()
+        return 0
+    print("usage: ghostty-tabs snapshot", file=sys.stderr)
+    return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))
