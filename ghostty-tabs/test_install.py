@@ -1,4 +1,4 @@
-"""Tests for install.sh. Each test runs the real script with a temporary HOME
+"""Each test runs the real script with a temporary HOME
 and stubs for git, snap, systemctl, curl and busctl on PATH. The stubs append
 their command line to $STUB_LOG."""
 import configparser

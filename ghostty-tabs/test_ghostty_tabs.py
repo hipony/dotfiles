@@ -353,7 +353,7 @@ def test_each_kind_gets_its_run_prefill_cwd_and_zdotdir(rs):
     assert len(rs.calls) == 3
     for index, (argv, cwd) in enumerate(zip(rs.calls, ["/a", "/b", "/c"])):
         assert f"--working-directory={cwd}" in argv
-        # +new-tab ignores --working-directory (Ghostty 1.4.0); env -C sets it.
+        # +new-tab ignores --working-directory (Ghostty 1.4.0). env --chdir sets the directory.
         assert argv[argv.index("env") + 1] == f"--chdir={cwd}"
         assert not any(a.startswith("--title") for a in argv)
         assert rs.envs(index)["ZDOTDIR"] == INTEGRATION

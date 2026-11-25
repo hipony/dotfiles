@@ -45,11 +45,10 @@ link "$DIR/ghostty-tabs/ghostty-tabs-snapshot.service" ~/.config/systemd/user/gh
 link "$DIR/ghostty-tabs/ghostty-tabs-snapshot.timer" ~/.config/systemd/user/ghostty-tabs-snapshot.timer
 link "$DIR/ghostty-tabs/ghostty-tabs-restore.desktop" ~/.config/autostart/ghostty-tabs-restore.desktop
 link "$DIR/ghostty/config.ghostty" ~/.config/ghostty/config.ghostty
-# D-Bus activation starts Ghostty through this unit. Do not enable it.
+# D-Bus activation starts Ghostty with app-com.mitchellh.ghostty.service. Do not enable it.
 link "$DIR/ghostty/com.mitchellh.ghostty.service" ~/.local/share/dbus-1/services/com.mitchellh.ghostty.service
 link "$DIR/ghostty/app-com.mitchellh.ghostty.service" ~/.config/systemd/user/app-com.mitchellh.ghostty.service
 
-# Magnolia theme for Ghostty and OpenCode
 MAGNOLIA="$HOME/dev/magnolia-theme"
 if [ -d "$MAGNOLIA" ]; then
   git -C "$MAGNOLIA" pull --ff-only
@@ -58,7 +57,7 @@ else
 fi
 link "$MAGNOLIA/exports/ghostty/Magnolia.ghostty" ~/.config/ghostty/themes/Magnolia
 link "$MAGNOLIA/exports/opencode/magnolia.json" ~/.config/opencode/themes/magnolia.json
-# Select the theme in OpenCode; keep every other key of cli.json.
+# Keep every other key of cli.json.
 python3 - "$HOME/.config/opencode/cli.json" <<'PY'
 import json, os, sys
 path = sys.argv[1]

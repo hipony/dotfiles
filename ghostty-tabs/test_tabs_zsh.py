@@ -1,4 +1,4 @@
-"""Tests for tabs.zsh. Each test runs a real `zsh -i` with a temporary HOME.
+"""Each test runs a real `zsh -i` with a temporary HOME.
 
 Test seam: tabs.zsh reads the namespaced variable GHOSTTY_TABS_PROC_ROOT as
 the directory that holds the process files of the parent chain (default
