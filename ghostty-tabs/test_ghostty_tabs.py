@@ -269,7 +269,7 @@ def test_live_record_without_cwd_is_deleted(env):
 # ---- restore ----
 
 UUID = "0b7f3c1e-1111-4222-8333-444455556666"
-INTEGRATION = "/snap/ghostty/current/share/ghostty/shell-integration/zsh"
+INTEGRATION = "/usr/share/ghostty/shell-integration/zsh"
 
 
 class Restore:

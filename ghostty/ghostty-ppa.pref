@@ -1,0 +1,12 @@
+# Take only ghostty from ppa:mkasberg/ghostty-ubuntu. Install.sh installs this
+# file as /etc/apt/preferences.d/ghostty-ppa.
+# Priority 1: no other package from the PPA replaces an Ubuntu package, and apt
+# does not upgrade it. Apt still installs a package that only the PPA has when
+# you ask for it or when a dependency needs it.
+Package: *
+Pin: release o=LP-PPA-mkasberg-ghostty-ubuntu
+Pin-Priority: 1
+
+Package: ghostty
+Pin: release o=LP-PPA-mkasberg-ghostty-ubuntu
+Pin-Priority: 500

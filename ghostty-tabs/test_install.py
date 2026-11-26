@@ -1,6 +1,7 @@
 """Each test runs the real script with a temporary HOME
-and stubs for git, snap, systemctl, curl and busctl on PATH. The stubs append
-their command line to $STUB_LOG."""
+and stubs for git, systemctl, curl, busctl, sudo and the apt tools on PATH.
+The stubs append their command line to $STUB_LOG. The sudo stub runs its
+command. The apt paths point into the temporary directory."""
 import configparser
 import json
 import os
@@ -20,6 +21,10 @@ LINKS = {
     ".config/systemd/user/ghostty-tabs-snapshot.timer": str(REPO / "ghostty-tabs/ghostty-tabs-snapshot.timer"),
     ".config/autostart/ghostty-tabs-restore.desktop": str(REPO / "ghostty-tabs/ghostty-tabs-restore.desktop"),
     ".config/ghostty/config.ghostty": str(REPO / "ghostty/config.ghostty"),
+}
+
+# The old install.sh linked these to repo files that the Ghostty package now supplies.
+OLD_GHOSTTY_LINKS = {
     ".local/share/dbus-1/services/com.mitchellh.ghostty.service": str(REPO / "ghostty/com.mitchellh.ghostty.service"),
     ".config/systemd/user/app-com.mitchellh.ghostty.service": str(REPO / "ghostty/app-com.mitchellh.ghostty.service"),
 }
@@ -28,7 +33,11 @@ STUBS = {
     "git": 'echo "git $*" >> "$STUB_LOG"\n'
            'if [ -n "$GIT_FAIL_MAGNOLIA" ] && [[ "$*" == *magnolia-theme* ]]; then exit 1; fi\n'
            'if [ "$1" = clone ]; then mkdir -p "${@: -1}"; fi\n',
-    "snap": 'echo "snap $*" >> "$STUB_LOG"\n',
+    "sudo": 'echo "sudo $*" >> "$STUB_LOG"\nexec "$@"\n',
+    "add-apt-repository": 'echo "add-apt-repository $*" >> "$STUB_LOG"\n'
+                          'touch "$GHOSTTY_APT_SOURCES/mkasberg-ubuntu-ghostty-ubuntu-resolute.sources"\n',
+    "apt-get": 'echo "apt-get $*" >> "$STUB_LOG"\ntouch "$STUB_LOG.installed"\n',
+    "dpkg-query": '[ -e "$STUB_LOG.installed" ] || exit 1\nprintf "install ok installed"\n',
     "systemctl": 'echo "systemctl $*" >> "$STUB_LOG"\n',
     "busctl": 'echo "busctl $*" >> "$STUB_LOG"\n',
     "curl": 'echo "curl $*" >> "$STUB_LOG"\n'
@@ -50,10 +59,15 @@ class Sandbox:
             p.chmod(0o755)
         self.path = f"{bindir}:/usr/bin:/bin"
         self.snap_bin = tmp_path / "snap-bin-ghostty"  # absent until a test creates it
+        self.pin = tmp_path / "apt/preferences.d/ghostty-ppa"
+        self.pin.parent.mkdir(parents=True)
+        self.sources = tmp_path / "apt/sources.list.d"
+        self.sources.mkdir()
 
     def run(self, **extra):
         env = {"HOME": str(self.home), "PATH": self.path, "STUB_LOG": str(self.log),
-               "GHOSTTY_SNAP_BIN": str(self.snap_bin), **extra}
+               "GHOSTTY_SNAP_BIN": str(self.snap_bin), "GHOSTTY_PIN": str(self.pin),
+               "GHOSTTY_APT_SOURCES": str(self.sources), **extra}
         return subprocess.run([str(INSTALL)], env=env, capture_output=True, text=True, timeout=60)
 
     def calls(self):
@@ -78,7 +92,17 @@ def test_creates_every_link_state_dir_and_enables_timer(sb):
     calls = sb.calls()
     assert "systemctl --user daemon-reload" in calls
     assert "systemctl --user enable --now ghostty-tabs-snapshot.timer" in calls
-    assert any(c.startswith("snap install ghostty --classic --channel=latest/stable") for c in calls)
+
+
+def test_ghostty_comes_from_the_ppa_after_the_pin(sb):
+    r = sb.run()
+    assert r.returncode == 0, r.stderr
+    assert [c for c in sb.calls() if c.startswith(("sudo ", "snap "))] == [
+        f"sudo install -m 644 {REPO}/ghostty/ghostty-ppa.pref {sb.pin}",
+        "sudo add-apt-repository -y ppa:mkasberg/ghostty-ubuntu",
+        "sudo apt-get install -y ghostty",
+    ]
+    assert sb.pin.read_text() == (REPO / "ghostty/ghostty-ppa.pref").read_text()
 
 
 def test_second_run_changes_nothing(sb):
@@ -88,6 +112,33 @@ def test_second_run_changes_nothing(sb):
     assert r.returncode == 0, r.stderr
     assert {rel: os.readlink(sb.link(rel)) for rel in LINKS} == before
     assert not list(sb.home.rglob("*.bak"))
+
+
+def test_second_run_does_not_call_sudo(sb):
+    assert sb.run().returncode == 0
+    sb.log.write_text("")
+    r = sb.run()
+    assert r.returncode == 0, r.stderr
+    assert not [c for c in sb.calls() if c.startswith("sudo ")]
+
+
+def test_old_ghostty_links_into_the_repo_are_removed(sb):
+    for rel, target in OLD_GHOSTTY_LINKS.items():
+        sb.link(rel).parent.mkdir(parents=True, exist_ok=True)
+        sb.link(rel).symlink_to(target)
+    r = sb.run()
+    assert r.returncode == 0, r.stderr
+    for rel in OLD_GHOSTTY_LINKS:
+        assert not os.path.lexists(sb.link(rel)), rel
+
+
+def test_ghostty_files_not_linked_into_the_repo_stay(sb):
+    for rel in OLD_GHOSTTY_LINKS:
+        sb.link(rel).parent.mkdir(parents=True, exist_ok=True)
+        sb.link(rel).write_text("mine\n")
+    assert sb.run().returncode == 0
+    for rel in OLD_GHOSTTY_LINKS:
+        assert sb.link(rel).read_text() == "mine\n", rel
 
 
 def test_regular_file_at_target_moves_to_bak(sb):
@@ -129,19 +180,14 @@ def test_units_and_autostart_use_paths_without_path_lookup():
     assert subprocess.run(["desktop-file-validate", str(REPO / "ghostty-tabs/ghostty-tabs-restore.desktop")]).returncode == 0
 
 
-def test_ghostty_files_use_absolute_snap_path_and_dbus_names():
-    exe = "/snap/bin/ghostty --gtk-single-instance=true --initial-window=false"
-    dbus = configparser.ConfigParser(interpolation=None, strict=False)
-    dbus.optionxform = str
-    dbus.read(REPO / "ghostty/com.mitchellh.ghostty.service")
-    assert dbus["D-BUS Service"]["Name"] == "com.mitchellh.ghostty"
-    assert dbus["D-BUS Service"]["SystemdService"] == "app-com.mitchellh.ghostty.service"
-    assert dbus["D-BUS Service"]["Exec"] == exe
-    unit = configparser.ConfigParser(interpolation=None, strict=False)
-    unit.optionxform = str
-    unit.read(REPO / "ghostty/app-com.mitchellh.ghostty.service")
-    assert unit["Service"]["ExecStart"] == exe
-    assert unit["Service"]["BusName"] == "com.mitchellh.ghostty"
+def test_pin_takes_only_ghostty_from_the_ppa():
+    stanzas = [dict(line.split(": ", 1) for line in block.splitlines() if not line.startswith("#"))
+               for block in (REPO / "ghostty/ghostty-ppa.pref").read_text().split("\n\n")]
+    origin = "release o=LP-PPA-mkasberg-ghostty-ubuntu"
+    assert stanzas == [
+        {"Package": "*", "Pin": origin, "Pin-Priority": "1"},
+        {"Package": "ghostty", "Pin": origin, "Pin-Priority": "500"},
+    ]
 
 
 def magnolia(sb):
@@ -194,11 +240,18 @@ def test_opencode_theme_object_keeps_its_other_keys(sb):
     assert json.loads(cli.read_text())["theme"] == {"name": "magnolia", "dark": True}
 
 
-def test_snap_is_not_installed_when_the_snap_binary_exists(sb):
+def test_installed_snap_ghostty_prints_a_warning(sb):
     sb.snap_bin.write_text("#!/bin/sh\n")
     sb.snap_bin.chmod(0o755)
-    assert sb.run().returncode == 0
-    assert not any(c.startswith("snap ") for c in sb.calls())
+    r = sb.run()
+    assert r.returncode == 0, r.stderr
+    assert "warning: the snap Ghostty is still installed; run sudo snap remove ghostty" in r.stderr
+
+
+def test_no_snap_warning_without_the_snap(sb):
+    r = sb.run()
+    assert r.returncode == 0, r.stderr
+    assert "snap" not in r.stderr
 
 
 @pytest.mark.parametrize("magnolia_exists", [True, False])

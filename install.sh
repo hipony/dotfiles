@@ -35,11 +35,22 @@ ln -sf $DIR/zshrc ~/.zshrc
 [ -d ~/.oh-my-zsh/custom/plugins/zsh-autosuggestions ] || git clone https://github.com/zsh-users/zsh-autosuggestions ~/.oh-my-zsh/custom/plugins/zsh-autosuggestions
 [ -d ~/.oh-my-zsh/custom/plugins/zsh-syntax-highlighting ] || git clone https://github.com/zsh-users/zsh-syntax-highlighting ~/.oh-my-zsh/custom/plugins/zsh-syntax-highlighting
 
-# Ghostty tab restore
-# The D-Bus and systemd files of this repo start /snap/bin/ghostty.
-# GHOSTTY_SNAP_BIN lets a test point this check elsewhere.
-if [ ! -x "${GHOSTTY_SNAP_BIN:-/snap/bin/ghostty}" ]; then
-  snap install ghostty --classic --channel=latest/stable
+# Ghostty from ppa:mkasberg/ghostty-ubuntu. The snap Ghostty renders on the CPU
+# when the NVIDIA driver drives the display.
+# GHOSTTY_PIN, GHOSTTY_APT_SOURCES and GHOSTTY_SNAP_BIN let a test point these
+# paths elsewhere. The pin comes first, so the PPA never has the default priority.
+GHOSTTY_PIN="${GHOSTTY_PIN:-/etc/apt/preferences.d/ghostty-ppa}"
+if ! cmp -s "$DIR/ghostty/ghostty-ppa.pref" "$GHOSTTY_PIN"; then
+  sudo install -m 644 "$DIR/ghostty/ghostty-ppa.pref" "$GHOSTTY_PIN"
+fi
+if ! compgen -G "${GHOSTTY_APT_SOURCES:-/etc/apt/sources.list.d}/mkasberg-ubuntu-ghostty-ubuntu-*.sources" > /dev/null; then
+  sudo add-apt-repository -y ppa:mkasberg/ghostty-ubuntu
+fi
+if [ "$(dpkg-query -W -f='${Status}' ghostty 2> /dev/null)" != "install ok installed" ]; then
+  sudo apt-get install -y ghostty
+fi
+if [ -e "${GHOSTTY_SNAP_BIN:-/snap/bin/ghostty}" ]; then
+  echo "warning: the snap Ghostty is still installed; run sudo snap remove ghostty" >&2
 fi
 
 link "$DIR/ghostty-tabs/ghostty-tabs" ~/.local/bin/ghostty-tabs
@@ -47,9 +58,15 @@ link "$DIR/ghostty-tabs/ghostty-tabs-snapshot.service" ~/.config/systemd/user/gh
 link "$DIR/ghostty-tabs/ghostty-tabs-snapshot.timer" ~/.config/systemd/user/ghostty-tabs-snapshot.timer
 link "$DIR/ghostty-tabs/ghostty-tabs-restore.desktop" ~/.config/autostart/ghostty-tabs-restore.desktop
 link "$DIR/ghostty/config.ghostty" ~/.config/ghostty/config.ghostty
-# D-Bus activation starts Ghostty with app-com.mitchellh.ghostty.service. Do not enable it.
-link "$DIR/ghostty/com.mitchellh.ghostty.service" ~/.local/share/dbus-1/services/com.mitchellh.ghostty.service
-link "$DIR/ghostty/app-com.mitchellh.ghostty.service" ~/.config/systemd/user/app-com.mitchellh.ghostty.service
+# The Ghostty package supplies the D-Bus file and app-com.mitchellh.ghostty.service,
+# and enables that unit for all users: Ghostty starts at login without a window.
+# Remove the links of an older install.sh to repo copies of these files.
+for old in ~/.local/share/dbus-1/services/com.mitchellh.ghostty.service \
+           ~/.config/systemd/user/app-com.mitchellh.ghostty.service; do
+  if [ -L "$old" ] && [[ "$(readlink "$old")" == "$DIR"/* ]]; then
+    rm "$old"
+  fi
+done
 
 MAGNOLIA="$HOME/dev/magnolia-theme"
 if [ -d "$MAGNOLIA" ]; then
@@ -81,8 +98,8 @@ PY
 mkdir -p ~/.local/state/ghostty-tabs
 chmod 700 ~/.local/state/ghostty-tabs
 
-# A running session D-Bus may not watch a service directory that was missing
-# at its start. Best effort: a failure does not stop the install.
+# The session D-Bus keeps a removed service file until a reload.
+# Best effort: a failure does not stop the install.
 if command -v busctl > /dev/null; then
   busctl --user call org.freedesktop.DBus /org/freedesktop/DBus org.freedesktop.DBus ReloadConfig > /dev/null ||
     echo "warning: D-Bus reload failed; Ghostty D-Bus activation works after the next login" >&2
