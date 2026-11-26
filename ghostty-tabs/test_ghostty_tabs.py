@@ -684,7 +684,7 @@ def test_first_window_shell_up_during_the_retry_wait_opens_no_second_window(rs):
     assert [a[1] for a in rs.calls] == ["+new-window", "+new-tab", "+new-tab"]
 
 
-# ---- restore --here (Decision 9) ----
+# ---- restore --here ----
 
 def test_here_returns_entry_1_and_the_child_opens_the_rest_in_the_window(rs):
     tabs3(rs)

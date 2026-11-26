@@ -262,7 +262,7 @@ def test_record_start_equals_the_process_table_start_of_the_same_pid(sh):
         p.wait(timeout=30)
 
 
-# ---- restore on the first window (Decision 9) ----
+# ---- restore on the first window ----
 
 STUB_RESTORE = """#!/bin/bash
 echo "$*" >> "$PROBE_OUT/stub_args"

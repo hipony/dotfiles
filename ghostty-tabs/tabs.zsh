@@ -130,7 +130,7 @@ add-zsh-hook precmd _ghostty_tabs_precmd
 add-zsh-hook zshexit _ghostty_tabs_zshexit
 _ghostty_tabs_write
 
-# Restore on the first window (Decision 9): when no older tab shell is alive,
+# Restore on the first window: when no older tab shell is alive,
 # this shell takes tab entry 1 of snapshot.json, and `ghostty-tabs restore
 # --here` opens the other tab entries in this window. The restore command runs
 # only in that case; the check itself uses builtins.

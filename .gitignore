@@ -1,4 +1,5 @@
 docs/plans/
+docs/specs/
 .skills/
 __pycache__/
 .pytest_cache/
