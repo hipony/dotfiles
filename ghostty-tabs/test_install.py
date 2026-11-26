@@ -1,7 +1,7 @@
 """Each test runs the real script with a temporary HOME
 and stubs for git, systemctl, curl, busctl, sudo and the apt tools on PATH.
 The stubs append their command line to $STUB_LOG. The sudo stub runs its
-command. The apt paths point into the temporary directory."""
+command. The apt paths and MAGNOLIA_DIR point into the temporary directory."""
 import configparser
 import json
 import os
@@ -47,6 +47,7 @@ STUBS = {
 
 class Sandbox:
     def __init__(self, tmp_path):
+        self.tmp = tmp_path
         self.home = tmp_path / "home"
         self.home.mkdir()
         self.log = tmp_path / "stub.log"
@@ -64,11 +65,23 @@ class Sandbox:
         self.sources = tmp_path / "apt/sources.list.d"
         self.sources.mkdir()
 
-    def run(self, **extra):
+    def run(self, install=INSTALL, **extra):
+        """A variable that is None in `extra` is not set."""
         env = {"HOME": str(self.home), "PATH": self.path, "STUB_LOG": str(self.log),
                "GHOSTTY_SNAP_BIN": str(self.snap_bin), "GHOSTTY_PIN": str(self.pin),
-               "GHOSTTY_APT_SOURCES": str(self.sources), **extra}
-        return subprocess.run([str(INSTALL)], env=env, capture_output=True, text=True, timeout=60)
+               "GHOSTTY_APT_SOURCES": str(self.sources), "MAGNOLIA_DIR": str(magnolia(self)), **extra}
+        env = {k: v for k, v in env.items() if v is not None}
+        return subprocess.run([str(install)], env=env, capture_output=True, text=True, timeout=60)
+
+    def checkout(self):
+        """A copy of the repo in the temporary directory, made of links to the
+        real files. An install.sh run from it finds the theme next to this copy."""
+        root = self.tmp / "src/hipony-dotfiles"
+        root.mkdir(parents=True)
+        for p in REPO.iterdir():
+            if p.name != ".git":
+                (root / p.name).symlink_to(p)
+        return root
 
     def calls(self):
         return self.log.read_text().splitlines()
@@ -207,6 +220,33 @@ def test_magnolia_theme_is_pulled_when_present(sb):
     assert sb.run().returncode == 0
     assert f"git -C {magnolia(sb)} pull --ff-only" in sb.calls()
     assert not any(c.startswith("git clone https://github.com/hipony/magnolia-theme") for c in sb.calls())
+
+
+def test_magnolia_dir_sets_the_place_of_the_theme_clone(sb):
+    clone = sb.home / "elsewhere/theme"
+    assert sb.run(MAGNOLIA_DIR=str(clone)).returncode == 0
+    assert f"git clone https://github.com/hipony/magnolia-theme.git {clone}" in sb.calls()
+    assert os.readlink(sb.link(".config/ghostty/themes/Magnolia")) == str(clone / "exports/ghostty/Magnolia.ghostty")
+
+
+@pytest.mark.parametrize("name", ["hipony-magnolia-theme", "magnolia-theme"])
+def test_theme_clone_next_to_the_repo_is_used(sb, name):
+    root = sb.checkout()
+    clone = root.parent / name
+    clone.mkdir()
+    r = sb.run(install=root / "install.sh", MAGNOLIA_DIR=None)
+    assert r.returncode == 0, r.stderr
+    assert f"git -C {clone} pull --ff-only" in sb.calls()
+    assert os.readlink(sb.link(".config/ghostty/themes/Magnolia")) == str(clone / "exports/ghostty/Magnolia.ghostty")
+
+
+def test_missing_theme_is_cloned_next_to_the_repo(sb):
+    root = sb.checkout()
+    clone = root.parent / "hipony-magnolia-theme"
+    r = sb.run(install=root / "install.sh", MAGNOLIA_DIR=None)
+    assert r.returncode == 0, r.stderr
+    assert f"git clone https://github.com/hipony/magnolia-theme.git {clone}" in sb.calls()
+    assert os.readlink(sb.link(".config/ghostty/themes/Magnolia")) == str(clone / "exports/ghostty/Magnolia.ghostty")
 
 
 def test_opencode_theme_is_selected_and_other_keys_stay(sb):

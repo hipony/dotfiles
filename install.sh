@@ -68,7 +68,20 @@ for old in ~/.local/share/dbus-1/services/com.mitchellh.ghostty.service \
   fi
 done
 
-MAGNOLIA="$HOME/dev/magnolia-theme"
+# The Magnolia theme clone is MAGNOLIA_DIR when that is set. If not, it is the
+# first of these directories next to this repo that exists. When none exists,
+# the theme is cloned to the first one.
+MAGNOLIA="${MAGNOLIA_DIR:-}"
+if [ -z "$MAGNOLIA" ]; then
+  PARENT="$(dirname "$DIR")"
+  MAGNOLIA="$PARENT/hipony-magnolia-theme"
+  for d in "$PARENT/hipony-magnolia-theme" "$PARENT/magnolia-theme"; do
+    if [ -d "$d" ]; then
+      MAGNOLIA="$d"
+      break
+    fi
+  done
+fi
 if [ -d "$MAGNOLIA" ]; then
   git -C "$MAGNOLIA" pull --ff-only ||
     echo "warning: git pull of $MAGNOLIA failed; the theme may be out of date" >&2
