@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """Save and restore the tabs of Ghostty. See docs/specs/2026-11-25-ghostty-tab-restore-design.md."""
+import fcntl
 import json
 import os
 import re
@@ -31,6 +32,29 @@ class Proc(NamedTuple):
 
 def state_root(home):
     return Path(home) / ".local/state/ghostty-tabs"
+
+
+def take_restore_lock(root, *, wait):
+    """Return restore.lock, open with an exclusive flock. Without wait, return None
+    when another process holds the lock. Closing the file releases the lock."""
+    root.mkdir(mode=0o700, parents=True, exist_ok=True)
+    f = open(root / "restore.lock", "a")
+    try:
+        fcntl.flock(f, fcntl.LOCK_EX | (0 if wait else fcntl.LOCK_NB))
+    except BlockingIOError:
+        f.close()
+        return None
+    return f
+
+
+def restore_lock_held(root):
+    if not (root / "restore.lock").exists():
+        return False
+    f = take_restore_lock(root, wait=False)
+    if f is None:
+        return True
+    f.close()
+    return False
 
 
 def read_process_table():
@@ -146,7 +170,7 @@ def snapshot(home, *, table, proc_cwd, system_state, boot_id, uptime, clk_tck):
     root = state_root(home)
     # Delete stale live records even when no write follows.
     live = read_live_records(root / "live", table)
-    if system_state == "stopping" or not live:
+    if system_state == "stopping" or not live or restore_lock_held(root):
         return False
     oldest_age = uptime - min(r["start"] for r in live) / clk_tck
     if not (root / f"restored-{boot_id}").exists() and oldest_age < MIN_TAB_AGE_SECONDS:
@@ -247,6 +271,29 @@ def build_ghostty_argv(tab, *, action, surface_id, tab_id, integration_dir, user
     return argv
 
 
+def ghostty_is_new_enough(get_version, log, notify):
+    version_text = get_version()
+    version = parse_ghostty_version(version_text)
+    if version is None or version < MIN_GHOSTTY:
+        msg = "Ghostty 1.4.0 or later is required for restore"
+        log(f"{msg} (found {version_text.splitlines()[0] if version_text else 'none'})")
+        notify(msg)
+        return False
+    return True
+
+
+def zsh_settings(env):
+    """The build_ghostty_argv keywords that give a restored zsh the Ghostty shell integration."""
+    resources = env.get("GHOSTTY_RESOURCES_DIR") or DEFAULT_RESOURCES_DIR
+    return dict(integration_dir=f"{resources}/shell-integration/zsh",
+                user_zdotdir=env.get("ZDOTDIR", ""))
+
+
+def write_marker(root, boot_id):
+    root.mkdir(mode=0o700, parents=True, exist_ok=True)
+    (root / f"restored-{boot_id}").write_text("")
+
+
 def restore(home, *, mode, boot_id, get_version, env, isdir, new_id, run_ghostty,
             find_surface_id, notify, sleep, monotonic, log):
     """Open one Ghostty tab for each tab entry of snapshot.json. mode: None, "force" or "skip".
@@ -256,35 +303,24 @@ def restore(home, *, mode, boot_id, get_version, env, isdir, new_id, run_ghostty
     root = state_root(home)
     marker = root / f"restored-{boot_id}"
 
-    def write_marker():
-        root.mkdir(mode=0o700, parents=True, exist_ok=True)
-        marker.write_text("")
-
     if mode == "skip":
         root.mkdir(mode=0o700, parents=True, exist_ok=True)
         if (root / "snapshot.json").exists():
             os.replace(root / "snapshot.json", root / "snapshot.skipped.json")
         (root / "snapshot.prev.json").unlink(missing_ok=True)
-        write_marker()
+        write_marker(root, boot_id)
         return "ok"
     if marker.exists() and mode != "force":
         return "ok"
-    version_text = get_version()
-    version = parse_ghostty_version(version_text)
-    if version is None or version < MIN_GHOSTTY:
-        msg = "Ghostty 1.4.0 or later is required for restore"
-        log(f"{msg} (found {version_text.splitlines()[0] if version_text else 'none'})")
-        notify(msg)
+    if not ghostty_is_new_enough(get_version, log, notify):
         return "ghostty-too-old"
     tabs = load_tabs(root, log)
     if not tabs:
         log("no tabs to restore")
-        write_marker()
+        write_marker(root, boot_id)
         return "ok"
 
-    resources = env.get("GHOSTTY_RESOURCES_DIR") or DEFAULT_RESOURCES_DIR
-    common = dict(integration_dir=f"{resources}/shell-integration/zsh",
-                  user_zdotdir=env.get("ZDOTDIR", ""))
+    common = zsh_settings(env)
     surface_id = None
     failed = 0
     for index, tab in enumerate(tabs):
@@ -327,10 +363,55 @@ def restore(home, *, mode, boot_id, get_version, env, isdir, new_id, run_ghostty
             if not ok:
                 failed += 1
                 log(f"+new-tab failed for {tab.get('cwd')}: {err}")
-    write_marker()
+    write_marker(root, boot_id)
     if failed:
         notify(f"{failed} tab(s) failed to restore")
     return "ok"
+
+
+def restore_here(home, *, surface_id, boot_id, get_version, env, isdir, new_id, run_ghostty,
+                 notify, spawn, log):
+    """Restore into the window of the calling tab shell (Decision 9).
+
+    Return the cwd, run, prefill and note of tab entry 1 for that shell, or None.
+    spawn(child) runs child in a detached process; child opens the other tab entries
+    and writes the boot marker last.
+    """
+    root = state_root(home)
+    lock = take_restore_lock(root, wait=False)
+    if lock is None:
+        return None
+    try:
+        if not ghostty_is_new_enough(get_version, log, notify):
+            return None
+        tabs = load_tabs(root, log)
+        if not tabs:
+            log("no tabs to restore")
+            return None
+        resolved = [resolve_tab(tab, home, isdir) for tab in tabs]
+        for tab in resolved:
+            if tab["note"]:
+                log(tab["note"])
+        common = zsh_settings(env)
+
+        def child():
+            failed = 0
+            for tab, entry in zip(resolved[1:], tabs[1:]):
+                argv = build_ghostty_argv(tab, action="+new-tab", surface_id=surface_id,
+                                          tab_id=new_id(), **common)
+                ok, err = run_ghostty(argv)
+                if not ok:
+                    failed += 1
+                    log(f"+new-tab failed for {entry.get('cwd')}: {err}")
+            write_marker(root, boot_id)
+            if failed:
+                notify(f"{failed} tab(s) failed to restore")
+
+        spawn(child)
+        first = resolved[0]
+        return [first["cwd"], first["run"], first["prefill"], first["note"]]
+    finally:
+        lock.close()  # the child keeps its own copy of the open lock file
 
 
 def read_ghostty_version():
@@ -388,8 +469,7 @@ def notify_send(message):
         pass
 
 
-def cmd_restore(mode):
-    home = Path.home()
+def make_log(home):
     log_path = state_root(home) / "restore.log"
 
     def log(message):
@@ -402,21 +482,71 @@ def cmd_restore(mode):
         except OSError:
             pass
 
-    return restore(
-        home, mode=mode, boot_id=read_boot_id(), get_version=read_ghostty_version,
+    return log
+
+
+def spawn_detached(child):
+    """Run child in a new session with stdio on /dev/null, and return at once.
+
+    A double fork: the caller does not wait for child, and child keeps no pipe of
+    the caller open. Open files, the restore lock among them, stay open in child.
+    """
+    sys.stdout.flush()
+    sys.stderr.flush()
+    pid = os.fork()
+    if pid:
+        os.waitpid(pid, 0)
+        return
+    try:
+        os.setsid()
+        if os.fork():
+            os._exit(0)
+        devnull = os.open(os.devnull, os.O_RDWR)
+        for fd in (0, 1, 2):
+            os.dup2(devnull, fd)
+        child()
+    finally:
+        os._exit(0)
+
+
+def cmd_restore_here(surface_id):
+    home = Path.home()
+    values = restore_here(
+        home, surface_id=surface_id, boot_id=read_boot_id(), get_version=read_ghostty_version,
         env=os.environ, isdir=os.path.isdir, new_id=lambda: secrets.token_hex(8),
-        run_ghostty=run_ghostty, find_surface_id=find_surface_id, notify=notify_send,
-        sleep=time.sleep, monotonic=time.monotonic, log=log)
+        run_ghostty=run_ghostty, notify=notify_send, spawn=spawn_detached, log=make_log(home))
+    if values:
+        text = "\0".join(v.replace("\0", "") for v in values)
+        sys.stdout.buffer.write(text.encode("utf-8", "surrogateescape"))
+
+
+def cmd_restore(mode):
+    home = Path.home()
+    log = make_log(home)
+    # Wait for a restore on the first window (Decision 9); its boot marker then stops this one.
+    lock = take_restore_lock(state_root(home), wait=True)
+    try:
+        return restore(
+            home, mode=mode, boot_id=read_boot_id(), get_version=read_ghostty_version,
+            env=os.environ, isdir=os.path.isdir, new_id=lambda: secrets.token_hex(8),
+            run_ghostty=run_ghostty, find_surface_id=find_surface_id, notify=notify_send,
+            sleep=time.sleep, monotonic=time.monotonic, log=log)
+    finally:
+        lock.close()
 
 
 def main(argv):
     if argv[1:] == ["snapshot"]:
         cmd_snapshot()
         return 0
+    if argv[1:3] == ["restore", "--here"] and len(argv) == 4:
+        cmd_restore_here(argv[3])
+        return 0
     if argv[1:2] == ["restore"] and argv[2:] in ([], ["--force"], ["--skip"]):
         status = cmd_restore({"--force": "force", "--skip": "skip"}.get(argv[2] if argv[2:] else ""))
         return 0 if status == "ok" else 1
-    print("usage: ghostty-tabs snapshot | restore [--force | --skip]", file=sys.stderr)
+    print("usage: ghostty-tabs snapshot | restore [--force | --skip | --here <surface-id>]",
+          file=sys.stderr)
     return 2
 
 

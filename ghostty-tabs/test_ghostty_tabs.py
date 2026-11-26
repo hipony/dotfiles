@@ -1,7 +1,10 @@
+import fcntl
 import importlib.machinery
 import importlib.util
 import json
 import os
+import subprocess
+import time
 from pathlib import Path
 
 import pytest
@@ -202,6 +205,26 @@ def test_no_write_without_marker_when_oldest_tab_is_young(env):
     assert env.snap() is None
 
 
+def hold_restore_lock(root):
+    """Hold restore.lock as another process would. Close the file to release it."""
+    root.mkdir(parents=True, exist_ok=True)
+    f = open(root / "restore.lock", "a")
+    fcntl.flock(f, fcntl.LOCK_EX)
+    return f
+
+
+def test_no_write_while_a_restore_holds_the_lock(env):
+    env.tab(100)
+    lock = hold_restore_lock(env.root)
+    try:
+        env.run()
+    finally:
+        lock.close()
+    assert env.snap() is None
+    env.run()
+    assert len(env.snap()) == 1
+
+
 def test_write_without_marker_when_oldest_tab_is_ten_minutes_old(env):
     env.marker = False
     env.tab(100, age=600)
@@ -320,6 +343,15 @@ class Restore:
             isdir=lambda p: p in self.dirs, new_id=lambda: next(self.ids),
             run_ghostty=self._ghostty, find_surface_id=self._surface,
             notify=self.notes.append, sleep=self._sleep, monotonic=lambda: self.now,
+            log=self.logs.append)
+
+    def run_here(self, surface="0xabc"):
+        """gt.restore_here with a fake spawn: the child functions wait in self.children."""
+        self.children = []
+        return gt.restore_here(
+            self.home, surface_id=surface, boot_id=BOOT, get_version=self._version,
+            env=self.env, isdir=lambda p: p in self.dirs, new_id=lambda: next(self.ids),
+            run_ghostty=self._ghostty, notify=self.notes.append, spawn=self.children.append,
             log=self.logs.append)
 
     @property
@@ -650,3 +682,139 @@ def test_first_window_shell_up_during_the_retry_wait_opens_no_second_window(rs):
     rs.results = [False]
     rs.run()
     assert [a[1] for a in rs.calls] == ["+new-window", "+new-tab", "+new-tab"]
+
+
+# ---- restore --here (Decision 9) ----
+
+def test_here_returns_entry_1_and_the_child_opens_the_rest_in_the_window(rs):
+    tabs3(rs)
+    assert rs.run_here() == ["/a", f"claude --resume {UUID}", "", ""]
+    assert rs.calls == [] and not rs.marker
+    [child] = rs.children
+    child()
+    assert [c[1:3] for c in rs.calls] == [["+new-tab", "--surface-id=0xabc"]] * 2
+    assert [rs.envs(i)["GHOSTTY_TABS_RUN"] for i in range(2)] == ["opencode", ""]
+    assert rs.envs(1)["GHOSTTY_TABS_PREFILL"] == "nvim x"
+    assert rs.marker
+
+
+def test_here_does_nothing_while_another_restore_holds_the_lock(rs):
+    tabs3(rs)
+    lock = hold_restore_lock(rs.root)
+    try:
+        assert rs.run_here() is None
+    finally:
+        lock.close()
+    assert rs.children == [] and rs.calls == [] and rs.version_calls == 0
+
+
+def test_here_ignores_the_boot_marker(rs):
+    tabs3(rs)
+    (rs.root / f"restored-{BOOT}").write_text("")
+    assert rs.run_here()[0] == "/a"
+    assert len(rs.children) == 1
+
+
+@pytest.mark.parametrize("case", ["no-snapshot", "both-corrupt", "old-ghostty"])
+def test_here_prints_nothing_and_writes_no_marker_without_tabs_or_with_an_old_ghostty(rs, case):
+    if case == "both-corrupt":
+        rs.write_snapshot([])
+        (rs.root / "snapshot.json").write_text("{")
+        (rs.root / "snapshot.prev.json").write_text("{")
+    elif case == "old-ghostty":
+        tabs3(rs)
+        rs.version = "Ghostty 1.3.0\n"
+    assert rs.run_here() is None
+    assert rs.children == [] and rs.calls == [] and not rs.marker
+    assert rs.logs
+    assert bool(rs.notes) == (case == "old-ghostty")
+
+
+def test_here_child_logs_and_counts_a_failed_tab_and_still_writes_the_marker(rs):
+    tabs3(rs)
+    rs.results = [False, True]
+    rs.run_here()
+    rs.children[0]()
+    assert len(rs.calls) == 2
+    assert any("+new-tab failed for /b" in line for line in rs.logs)
+    assert rs.notes == ["1 tab(s) failed to restore"]
+    assert rs.marker
+
+
+# ---- process level: the real command with a fake ghostty on PATH ----
+
+FAKE_GHOSTTY = """#!/bin/bash
+if [ "$1" = --version ]; then echo "Ghostty 1.4.0"; exit 0; fi
+[ "$1" = +new-tab ] && sleep "${FAKE_TAB_SECONDS:-0}"
+echo "$*" >> "$FAKE_LOG"
+"""
+
+
+class Process:
+    def __init__(self, tmp_path):
+        self.home = tmp_path / "home"
+        self.root = self.home / ".local/state/ghostty-tabs"
+        self.root.mkdir(parents=True)
+        bindir = tmp_path / "bin"
+        bindir.mkdir()
+        (bindir / "ghostty").write_text(FAKE_GHOSTTY)
+        (bindir / "ghostty").chmod(0o755)
+        (bindir / "notify-send").write_text("#!/bin/sh\n")
+        (bindir / "notify-send").chmod(0o755)
+        self.log = tmp_path / "ghostty.log"
+        self.dirs = [tmp_path / "a", tmp_path / "b"]
+        for d in self.dirs:
+            d.mkdir()
+        self.env = {"HOME": str(self.home), "PATH": f"{bindir}:/usr/bin:/bin",
+                    "FAKE_LOG": str(self.log)}
+        self.marker = self.root / f"restored-{gt.read_boot_id()}"
+
+    def write_two_tabs(self):
+        (self.root / "snapshot.json").write_text(json.dumps([
+            {"kind": "claude", "cwd": str(self.dirs[0]), "session": UUID, "prefill": ""},
+            {"kind": "shell", "cwd": str(self.dirs[1]), "session": "", "prefill": "ls"},
+        ]))
+
+    def start(self, *args, **env):
+        return subprocess.Popen([_path, *args], env={**self.env, **env},
+                                stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+
+    def calls(self):
+        return self.log.read_text().splitlines() if self.log.exists() else []
+
+
+def wait_for(predicate, seconds=10):
+    deadline = time.monotonic() + seconds
+    while not predicate():
+        if time.monotonic() > deadline:
+            return False
+        time.sleep(0.05)
+    return True
+
+
+def test_here_command_prints_4_nul_separated_values_without_waiting_for_the_child(tmp_path):
+    pr = Process(tmp_path)
+    pr.write_two_tabs()
+    began = time.monotonic()
+    out, _ = pr.start("restore", "--here", "0xabc", FAKE_TAB_SECONDS="2").communicate(timeout=10)
+    assert time.monotonic() - began < 1.5
+    assert out == f"{pr.dirs[0]}\0claude --resume {UUID}\0\0".encode()
+    assert not pr.marker.exists()
+    assert wait_for(pr.marker.exists)
+    [call] = pr.calls()
+    assert call.startswith("+new-tab --surface-id=0xabc ")
+
+
+def test_login_restore_waits_for_the_lock_and_then_skips_after_the_marker(tmp_path):
+    pr = Process(tmp_path)
+    pr.write_two_tabs()
+    lock = hold_restore_lock(pr.root)
+    proc = pr.start("restore")
+    try:
+        time.sleep(0.5)
+        assert proc.poll() is None
+        pr.marker.write_text("")
+    finally:
+        lock.close()
+    assert proc.wait(timeout=30) == 0
+    assert pr.calls() == []

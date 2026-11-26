@@ -129,3 +129,36 @@ add-zsh-hook preexec _ghostty_tabs_preexec
 add-zsh-hook precmd _ghostty_tabs_precmd
 add-zsh-hook zshexit _ghostty_tabs_zshexit
 _ghostty_tabs_write
+
+# Restore on the first window (Decision 9): when no older tab shell is alive,
+# this shell takes tab entry 1 of snapshot.json, and `ghostty-tabs restore
+# --here` opens the other tab entries in this window. The restore command runs
+# only in that case; the check itself uses builtins.
+_ghostty_tabs_first_window() {
+  emulate -L zsh
+  [[ -z ${GHOSTTY_TABS_ID-} && -n ${GHOSTTY_SURFACE_ID-} ]] || return 0
+  [[ -e ${_ghostty_tabs_dir:h}/snapshot.json ]] || return 0
+  local f pid rec start stat out
+  local -a fields vals
+  for f in $_ghostty_tabs_dir/<->.json(N); do
+    pid=${f:t:r}
+    (( pid == $$ )) && continue
+    [[ -r /proc/$pid/stat ]] || continue
+    rec=$(<$f) 2>/dev/null || continue
+    start=${${rec#*\"start\": }%%,*}
+    [[ $start == <-> ]] || continue
+    stat=$(</proc/$pid/stat) 2>/dev/null || continue
+    fields=(${=stat##*) })
+    [[ ${fields[20]} == $start ]] || continue  # the PID belongs to another process now
+    # The smaller start, then the smaller PID, is the older tab shell.
+    (( start < _ghostty_tabs_start || (start == _ghostty_tabs_start && pid < $$) )) && return 0
+  done
+  out=$(timeout 5 $HOME/.local/bin/ghostty-tabs restore --here $GHOSTTY_SURFACE_ID 2>/dev/null) || return 0
+  vals=("${(@0)out}")
+  (( $#vals == 4 )) || return 0
+  cd -q -- $vals[1] 2>/dev/null
+  # The first precmd acts on these as for a restored tab.
+  typeset -g GHOSTTY_TABS_RUN=$vals[2] GHOSTTY_TABS_PREFILL=$vals[3] GHOSTTY_TABS_NOTE=$vals[4]
+}
+_ghostty_tabs_first_window
+unfunction _ghostty_tabs_first_window

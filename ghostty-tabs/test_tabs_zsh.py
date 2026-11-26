@@ -260,3 +260,130 @@ def test_record_start_equals_the_process_table_start_of_the_same_pid(sh):
     finally:
         p.stdin.close()
         p.wait(timeout=30)
+
+
+# ---- restore on the first window (Decision 9) ----
+
+STUB_RESTORE = """#!/bin/bash
+echo "$*" >> "$PROBE_OUT/stub_args"
+cat "$PROBE_OUT/stub_out"
+"""
+
+
+def proc_start(pid):
+    stat = Path(f"/proc/{pid}/stat").read_text()
+    return int(stat[stat.rindex(")") + 2:].split()[19])
+
+
+class FirstWindow:
+    def __init__(self, sh):
+        self.sh = sh
+        sh.fake_parent()
+        stub = sh.home / ".local/bin/ghostty-tabs"
+        stub.parent.mkdir(parents=True)
+        stub.write_text(STUB_RESTORE)
+        stub.chmod(0o755)
+        self.state = sh.home / ".local/state/ghostty-tabs"
+        self.state.mkdir(parents=True)
+        (self.state / "snapshot.json").write_text("[]")
+        self.output(b"")
+        self.env = {"GHOSTTY_SURFACE_ID": "0x1"}
+        self.others = []
+
+    def output(self, data):
+        (self.sh.out / "stub_out").write_bytes(data)
+
+    def other_tab_shell(self, pid, start):
+        live = self.state / "live"
+        live.mkdir(exist_ok=True)
+        (live / f"{pid}.json").write_text(json.dumps(
+            {"pid": pid, "start": start, "cwd": "/", "running": "", "pending": ""}))
+
+    def older_tab_shell(self):
+        p = subprocess.Popen(["sleep", "30"])
+        self.others.append(p)
+        self.other_tab_shell(p.pid, proc_start(p.pid))
+
+    def run(self, script="pwd > $PROBE_OUT/pwd\n", env=None):
+        return self.sh.run(script, env={**self.env, **(env or {})})
+
+    def fired(self):
+        args = self.sh.out / "stub_args"
+        return args.read_text().splitlines() if args.exists() else []
+
+    def pwd(self):
+        return (self.sh.out / "pwd").read_text().strip()
+
+
+@pytest.fixture
+def fw(sh):
+    f = FirstWindow(sh)
+    yield f
+    for p in f.others:
+        p.kill()
+        p.wait()
+
+
+def test_first_tab_shell_takes_tab_entry_1(fw, tmp_path):
+    d = tmp_path / "entry1"
+    d.mkdir()
+    fw.output(f"{d}\0print -r -- ran >> {fw.sh.out}/ran\0\0a note".encode())
+    r = fw.run()
+    assert fw.fired() == ["restore --here 0x1"]
+    assert fw.pwd() == str(d)
+    assert (fw.sh.out / "ran").read_text() == "ran\n"
+    assert "a note" in r.stdout
+
+
+def test_first_tab_shell_gets_the_prefill_of_tab_entry_1(fw, tmp_path):
+    fw.output(f"{tmp_path}\0\0nvim x\0".encode())
+    fw.run("IFS= read -rzd '' buf\nprint -r -- \"$buf\" > $PROBE_OUT/buf\n")
+    assert (fw.sh.out / "buf").read_text().rstrip("\n") == "nvim x"
+    assert fw.sh.prompts()[0]["pending"] == "nvim x"
+
+
+def test_record_of_a_dead_shell_does_not_block_the_trigger(fw):
+    fw.other_tab_shell(os.getpid(), proc_start(os.getpid()) + 1)  # start does not match
+    fw.run()
+    assert fw.fired() == ["restore --here 0x1"]
+
+
+def test_younger_tab_shell_does_not_block_the_trigger(fw):
+    rc = fw.sh.zdot / ".zshrc"
+    rc.write_text(
+        "sleep 30 < /dev/null > /dev/null 2>&1 &!\n"
+        "print -r -- $! > $PROBE_OUT/younger\n"
+        "zmodload zsh/system\n"
+        "_s=$(</proc/$!/stat); _f=(${=_s##*) })\n"
+        "mkdir -p $HOME/.local/state/ghostty-tabs/live\n"
+        "print -r -- \"{\\\"pid\\\": $!, \\\"start\\\": $_f[20], \\\"cwd\\\": \\\"/\\\", "
+        "\\\"running\\\": \\\"\\\", \\\"pending\\\": \\\"\\\"}\" "
+        "> $HOME/.local/state/ghostty-tabs/live/$!.json\n" + rc.read_text())
+    fw.run()
+    os.kill(int((fw.sh.out / "younger").read_text()), 9)
+    assert fw.fired() == ["restore --here 0x1"]
+
+
+@pytest.mark.parametrize("case", ["restored-tab", "no-surface", "no-snapshot", "older-tab-shell"])
+def test_trigger_does_not_fire(fw, case):
+    env = {}
+    if case == "restored-tab":
+        env = {"GHOSTTY_TABS_ID": "x", "GHOSTTY_TABS_RUN": "", "GHOSTTY_TABS_PREFILL": "",
+               "GHOSTTY_TABS_NOTE": ""}
+    elif case == "no-surface":
+        fw.env = {}
+    elif case == "no-snapshot":
+        (fw.state / "snapshot.json").unlink()
+    else:
+        fw.older_tab_shell()
+    fw.run(env=env)
+    assert fw.fired() == []
+
+
+@pytest.mark.parametrize("data", [b"", b"/\0two\0three", b"/\0a\0b\0c\0e"])
+def test_output_without_exactly_4_values_leaves_a_plain_shell(fw, data):
+    fw.output(data)
+    fw.run("pwd > $PROBE_OUT/pwd\ntrue\n")
+    assert fw.fired() == ["restore --here 0x1"]
+    assert fw.pwd() == str(fw.sh.cwd)
+    assert [p["running"] for p in fw.sh.prompts()] == ["", "", ""]
